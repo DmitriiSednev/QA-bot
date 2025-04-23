@@ -96,13 +96,14 @@ def router_node(state: AgentState, llm):
         print(f"Router node: Извлеченный tool_call_id: {tool_call_id}")
 
         # Добавляем сообщение AI с запросом на вызов инструмента в историю
-        state["messages"] += [ai_message]
+        # УДАЛЯЕМ ручное добавление: state["messages"] += [ai_message]
 
         return_state = {
             "next_node": "tool_executor",
             "tool_to_call": tool_name,
             "tool_input": tool_input,
             "current_tool_call_id": tool_call_id,
+            "messages": [ai_message],  # ВОЗВРАЩАЕМ сообщение AI здесь
         }
         print(f"Router node: Возвращаемое состояние: {return_state}")
         return return_state
@@ -193,38 +194,54 @@ def tool_output_guardrails_node(state: AgentState):
 
 # ---- НОВЫЙ УЗЕЛ для обработки результата инструмента ----
 def handle_tool_result_node(state: AgentState):
-    """Преобразует результат инструмента в ToolMessage и добавляет к истории."""
+    """Преобразует результат инструмента в ToolMessage и добавляет к истории,
+    используя правильный tool_call_id из последнего AIMessage.
+    """
     print("--- Вход в Handle Tool Result --- ")
     print(f"Handle Tool Result: Входящее состояние: {state}")
     tool_result = state.get("tool_result")
-    tool_name = state.get("tool_name_executed") or state.get("tool_to_call")
-    current_tool_call_id = state.get("current_tool_call_id")
-    print(
-        f"Handle Tool Result: Извлеченный current_tool_call_id: {current_tool_call_id}"
-    )
+    tool_name_executed = state.get("tool_name_executed")
+    # tool_to_call = state.get("tool_to_call") # Имя инструмента, который *запросили* (уже не так важно здесь)
 
-    if not tool_name:
-        print("Не удалось определить имя инструмента для обработки результата.")
+    if not tool_name_executed:
+        print(
+            "Не удалось определить имя выполненного инструмента для обработки результата."
+        )
+        # Просто возвращаем текущие сообщения, чтобы не прерывать поток
         return {"messages": state["messages"]}
 
-    # --- Проверка current_tool_call_id (должен существовать) ---
-    if not current_tool_call_id:
-        # Эта ситуация теперь ОЧЕНЬ маловероятна
+    # --- Ищем последний AIMessage с tool_calls, чтобы извлечь ID ---
+    last_ai_message_with_tool_calls = None
+    extracted_tool_call_id = None
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            last_ai_message_with_tool_calls = msg
+            # Предполагаем, что роутер вызывает только один инструмент за раз
+            if msg.tool_calls:
+                extracted_tool_call_id = msg.tool_calls[0]["id"]
+            break  # Нашли последнее нужное сообщение, выходим
+
+    print(f"Handle Tool Result: Извлеченный tool_call_id: {extracted_tool_call_id}")
+
+    # --- Создаем ToolMessage ---
+    if not extracted_tool_call_id:
+        # Если не нашли ID (очень странно), используем старый fallback
         print(
-            f"КРИТИЧЕСКАЯ ОШИБКА: current_tool_call_id = None в handle_tool_result_node для инструмента {tool_name}!"
+            f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось извлечь tool_call_id из AIMessage для инструмента {tool_name_executed}! Использую fallback."
         )
-        # Создаем ToolMessage с ошибкой и фиктивным ID
         tool_message = ToolMessage(
-            content=f"Критическая ошибка: current_tool_call_id отсутствует для {tool_name}",
-            name=tool_name,
-            tool_call_id="error_critical_missing_id",
+            content=f"Критическая ошибка: не найден tool_call_id для {tool_name_executed}. Результат: {tool_result}",
+            name=tool_name_executed,  # Используем имя реально выполненного инструмента
+            tool_call_id="error_no_tool_call_id_found",
         )
     else:
         # Нормальный случай: создаем ToolMessage с реальным ID
         tool_message = ToolMessage(
-            content=str(tool_result), name=tool_name, tool_call_id=current_tool_call_id
+            content=str(tool_result),
+            name=tool_name_executed,
+            tool_call_id=extracted_tool_call_id,
         )
-        print(f"Создано ToolMessage с tool_call_id: {tool_message}")
+        print(f"Создано ToolMessage: {tool_message}")
 
     # Добавляем ToolMessage к истории сообщений
     return {"messages": state["messages"] + [tool_message]}

@@ -148,10 +148,43 @@ cython_debug/
 # Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
 # Logs
 *.log
 *.log.*
 
 # User specified
-+.+ 
++.+
+
+# Папки виртуальных окружений
+/.venv/
+/venv/
+/env/
+/.env/
+
+# Файл с секретами
+.env
+
+# Кэш Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Файлы архивов
+*.zip
+
+# Конкретный файл, указанный пользователем
++_+
+
+# Другие возможные файлы IDE/OS
+.vscode/
+.idea/
+*.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw? 
