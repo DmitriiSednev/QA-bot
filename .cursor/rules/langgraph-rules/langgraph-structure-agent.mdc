@@ -1,0 +1,65 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# LangGraph Structure for QA Bot
+
+## Critical Rules
+- Состояние графа (`AgentState`) ДОЛЖНО быть определено с использованием `TypedDict` из `typing` (или Pydantic модели) для явного указания структуры данных, передаваемых между узлами.
+- Каждый логический шаг агента (планирование, вызов инструмента, генерация ответа, guardrails) ДОЛЖЕН быть реализован как отдельный узел (функция или метод класса).
+- Узлы ДОЛЖНЫ принимать `AgentState` в качестве аргумента и возвращать словарь с обновленными полями состояния.
+- Переходы между узлами (рёбра) ДОЛЖНЫ использовать `add_conditional_edges`, если логика ветвления сложнее простого последовательного вызова. Функция условия должна принимать `AgentState` и возвращать имя следующего узла.
+- Граф (`graph = StateGraph(AgentState)`) и его скомпилированная версия (`app = graph.compile()`) должны быть созданы в основном файле логики агента (например, `agent/agent_executor.py`).
+- Используй `RunnableConfig` при вызове `.stream()` или `.invoke()` на скомпилированном графе (`app`), чтобы передавать метаданные, такие как `configurable={"thread_id": ...}` для управления состоянием между вызовами.
+
+## Examples
+<example>
+# Хороший пример: TypedDict для состояния, отдельные узлы
+from typing import TypedDict, Annotated, Sequence
+import operator
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import BaseMessage
+
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], operator.add]
+    next_node: str # Поле для условных переходов
+
+def planning_node(state: AgentState):
+    # ... логика планирования
+    return {"next_node": "tool_node" if needs_tool else "response_node"}
+
+def tool_node(state: AgentState):
+    # ... логика вызова инструмента
+    return {"messages": [tool_output_message]}
+
+# Создание графа
+graph = StateGraph(AgentState)
+graph.add_node("planner", planning_node)
+graph.add_node("tools", tool_node)
+# ... другие узлы
+
+graph.add_conditional_edges(
+    "planner",
+    lambda state: state["next_node"],
+    {"tool_node": "tools", "response_node": "responder", END: END}
+)
+graph.set_entry_point("planner")
+app = graph.compile()
+
+# Вызов
+config = {"configurable": {"thread_id": "user_123"}}
+for event in app.stream({"messages": [user_message]}, config=config):
+    # ... обработка событий
+</example>
+
+<example type="invalid">
+# Плохой пример: нет явного состояния, вся логика в одной функции
+def handle_message(user_input):
+    # ... планирование, вызов инструмента, генерация ответа - всё вместе
+    # ... неявно используется глобальное состояние или передача через аргументы
+    # ... сложно тестировать и модифицировать
+    return final_response
+
+# Нет явного определения графа
+</example> 

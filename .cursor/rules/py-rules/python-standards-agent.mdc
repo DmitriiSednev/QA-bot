@@ -1,0 +1,41 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Python Standards for QA Bot Project
+
+## Critical Rules
+- Весь Python код ДОЛЖЕН использовать аннотации типов (type hints) для аргументов функций, возвращаемых значений и переменных там, где это уместно.
+- Код ДОЛЖЕН форматироваться с использованием `black`.
+- Код ДОЛЖЕН проходить проверку линтером `flake8` (или аналогом, если будет выбран).
+- Все зависимости проекта ДОЛЖНЫ быть перечислены в файле `requirements.txt` с указанием версий (например, `langchain==0.1.0`). Используй `pip freeze > requirements.txt` для обновления из активного `venv`.
+- Проект ДОЛЖЕН использовать виртуальное окружение (`venv`) для изоляции зависимостей.
+
+## Examples
+<example>
+# Хороший пример: type hints, форматирование black
+import os
+from typing import Optional
+
+def get_api_key(env_var: str = "TELEGRAM_BOT_TOKEN") -> Optional[str]:
+    """Retrieves an API key from environment variables."""
+    return os.environ.get(env_var)
+
+# requirements.txt
+# langchain==0.1.16
+# python-dotenv==1.0.1
+</example>
+
+<example type="invalid">
+# Плохой пример: нет type hints, не отформатировано
+import os
+
+def get_key (var):
+        key=os.environ.get(var)
+        return key
+
+# requirements.txt (без версий)
+# langchain
+# python-dotenv
+</example> 

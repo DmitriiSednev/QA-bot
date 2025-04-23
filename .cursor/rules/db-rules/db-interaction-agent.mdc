@@ -1,0 +1,85 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Database Interaction Rules for QA Bot
+
+## Critical Rules
+- Взаимодействие с БД (подключение, выполнение запросов) ДОЛЖНО быть инкапсулировано в классах или функциях внутри директории `database/` (например, `database/connection.py`, `database/crud.py`).
+- Инструменты НЕ ДОЛЖНЫ напрямую использовать коннекторы к БД (`psycopg2`, `sqlalchemy.create_engine`). Вместо этого они должны вызывать функции/методы из модуля `database/`.
+- Используй ORM (например, SQLAlchemy) или структурированные запросы для CRUD операций, чтобы избежать SQL-инъекций. Не используй конкатенацию строк для построения SQL-запросов с пользовательскими данными.
+- Соединение с БД ДОЛЖНО управляться через менеджеры контекста (`with ...:`), если используются прямые курсоры, или через сессии, если используется SQLAlchemy, для гарантии закрытия соединения/возврата в пул.
+- Логика работы с векторным хранилищем (например, `SupabaseVectorStore` из Langchain) должна быть вынесена в отдельный модуль (например, `database/vector_store.py`).
+- Обрабатывай возможные ошибки БД (например, `psycopg2.Error`, `sqlalchemy.exc.SQLAlchemyError`) в коде `database/` и возвращай понятные ошибки или `None` инструментам.
+- Не храни учетные данные БД (хост, порт, юзер, пароль) в коде. Используй переменные окружения и файл `.env` (который должен быть в `.gitignore`).
+
+## Examples
+<example>
+# Хороший пример: логика БД в database/, инструмент использует эту логику
+
+# database/crud.py
+from sqlalchemy.orm import Session
+from . import models # SQLAlchemy модели
+
+def add_qa_pair(db: Session, question: str, answer: str) -> models.FAQEntry:
+    db_entry = models.FAQEntry(question=question, answer=answer)
+    db.add(db_entry)
+    db.commit()
+    db.refresh(db_entry)
+    return db_entry
+
+# agent/tools/add_faq.py
+from langchain.tools import BaseTool
+from database import crud, connection # Импортируем логику БД
+
+class AddFAQTool(BaseTool):
+    name = "add_faq"
+    description = "Adds a new question-answer pair to the database."
+
+    def _run(self, question: str, answer: str):
+        try:
+            # Получаем сессию из модуля connection
+            with connection.get_db_session() as db:
+                entry = crud.add_qa_pair(db, question, answer)
+                # Обновляем векторное хранилище...
+                return f"Successfully added Q&A pair with ID {entry.id}"
+        except Exception as e:
+            # Логирование ошибки
+            return f"Error adding Q&A pair: {e}"
+</example>
+
+<example type="invalid">
+# Плохой пример: инструмент напрямую подключается к БД
+
+# agent/tools/add_faq_bad.py
+import psycopg2
+import os
+from langchain.tools import BaseTool
+
+class AddFAQToolBad(BaseTool):
+    name = "add_faq_bad"
+    description = "Bad example: tool connects directly."
+
+    def _run(self, question: str, answer: str):
+        conn = None
+        try:
+            # Прямое подключение в инструменте - ПЛОХО!
+            conn = psycopg2.connect(
+                host=os.getenv("DB_HOST"), 
+                database=os.getenv("DB_NAME"),
+                user=os.getenv("DB_USER"),
+                password=os.getenv("DB_PASS")
+            )
+            cur = conn.cursor()
+            # Небезопасный запрос - ПЛОХО!
+            cur.execute(f"INSERT INTO faqs (question, answer) VALUES ('{question}', '{answer}')")
+            conn.commit()
+            cur.close()
+            return "Added maybe?"
+        except Exception as e:
+            return f"Error: {e}"
+        finally:
+            if conn is not None:
+                conn.close()
+</example> 

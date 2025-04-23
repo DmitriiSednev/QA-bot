@@ -1,0 +1,72 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Tool Design Rules for QA Bot
+
+## Critical Rules
+- Каждый инструмент ДОЛЖЕН наследоваться от `langchain_core.tools.BaseTool`.
+- У каждого инструмента ДОЛЖНЫ быть четко определены атрибуты `name` (уникальное имя) и `description` (подробное описание для LLM, объясняющее, что делает инструмент, когда его использовать, и какие аргументы он ожидает).
+- Схема аргументов инструмента (`args_schema`) ДОЛЖНА быть определена с использованием Pydantic модели для валидации входных данных и предоставления информации LLM.
+- Основная логика инструмента ДОЛЖНА находиться в методе `_run()` (для синхронного выполнения) или `_arun()` (для асинхронного).
+- Инструменты ДОЛЖНЫ обрабатывать ожидаемые ошибки (например, запись не найдена, API вернул ошибку) внутри `_run()`/`_arun()` и возвращать информативное сообщение об ошибке пользователю/агенту. Неожиданные ошибки должны логироваться и также возвращать сообщение об ошибке.
+- Инструменты НЕ ДОЛЖНЫ содержать сложной бизнес-логики или прямого взаимодействия с внешними системами, кроме необходимого. Выноси такую логику в отдельные модули (например, `database/crud.py`, `core/utils.py`).
+- Описание (`description`) ДОЛЖНО быть максимально ясным и недвусмысленным для LLM. Укажи, какие входные данные нужны и что инструмент возвращает.
+
+## Examples
+<example>
+# Хороший пример: Pydantic схема, четкое описание, обработка ошибок
+from langchain_core.tools import BaseTool
+from langchain_core.pydantic_v1 import BaseModel, Field
+from typing import Type, Optional
+from database import crud, connection, models # Импорт логики БД
+import logging
+
+class SearchFAQInput(BaseModel):
+    query: str = Field(description="The question to search for in the FAQ database.")
+
+class SearchFAQTool(BaseTool):
+    name: str = "search_faq"
+    description: str = "Searches the FAQ database for entries matching the user's query. Returns relevant Q&A pairs or a message if nothing is found."
+    args_schema: Type[BaseModel] = SearchFAQInput
+
+    def _run(self, query: str) -> str:
+        logging.info(f"Running search_faq tool with query: {query}")
+        try:
+            with connection.get_db_session() as db:
+                results: list[models.FAQEntry] = crud.search_faq_entries(db, query)
+                if not results:
+                    return "No relevant FAQ entries found for your query."
+                
+                # Здесь можно добавить логику поиска по векторам...
+                
+                response = "Found relevant FAQs:\n"
+                for entry in results[:3]: # Ограничиваем вывод
+                    response += f"- Q: {entry.question}\n  A: {entry.answer}\n"
+                return response
+        except Exception as e:
+            logging.error(f"Error in SearchFAQTool: {e}", exc_info=True)
+            return f"An error occurred while searching the FAQ: {e}"
+        
+    # async def _arun(self, query: str) -> str: # Асинхронная версия, если нужно
+    #     pass
+</example>
+
+<example type="invalid">
+# Плохой пример: нет схемы, нечеткое описание, нет обработки ошибок
+from langchain_core.tools import BaseTool
+# Нет импорта логики БД
+
+class BadSearchTool(BaseTool):
+    name = "search"
+    description = "Does a search." # Слишком неясно!
+    # Нет args_schema
+
+    def _run(self, query):
+        # Прямые вызовы к БД или сложная логика здесь - ПЛОХО
+        # Нет try...except
+        # ... выполняет поиск ...
+        raw_results = ... 
+        return str(raw_results) # Неформатированный вывод
+</example> 

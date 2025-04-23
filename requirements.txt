@@ -1,0 +1,28 @@
+# Core LangChain/LangGraph
+langchain
+langgraph
+langchain-community
+langchain-openai # For OpenAI compatible APIs like the proxy
+
+# Telegram Bot
+python-telegram-bot
+
+# Database (PostgreSQL for Supabase/Neon)
+psycopg2-binary # Or asyncpg if we go async
+sqlalchemy # Optional ORM
+pgvector # Добавлено для векторного поиска
+
+# Environment Variables
+python-dotenv
+
+# Web Search
+duckduckgo-search
+
+# Vector Store (Example for Supabase)
+# supabase
+# We might need specific vector store integrations later
+
+# Utilities & Quality (Optional but Recommended)
+# black
+# flake8
+# mypy 

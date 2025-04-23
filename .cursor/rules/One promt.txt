@@ -1,0 +1,105 @@
+@https://www.anthropic.com/engineering/building-effective-agents @https://github.com/langchain-ai/langgraph 
+Подумай шаг за шагом и создай план перед тем как мне ответить. Ты можешь поискать в интернете, использовать то что лучше всего подойдет для этого проекта и хорошо интегрируется, langgraph, pydantic и т.д. У меня есть задача сделать проект с QA ботом(или агентом/агентской системой) который отвечает в телеграмме на вопросы пользователя, он должен быть интегрирован в чат в телеграмме. Прочитай что я тебе прислал, проанализируй и скажи мне, у меня есть возможность подключить и делать этот проект через виртуальную машину, или мне его лучше делать локально в терминале power shell моего ноутбука? Предложи архитектуру проекта. Q- это вопрос пользователя, A-это ответ на вопрос пользователя. 
+Мой QAботик должен быть примерно такой архитектуры:
+
+graph TD
+    subgraph User Interface (e.g., Telegram)
+        UI_Input[User Message/Command]
+        UI_Output[Bot Response/Status]
+    end
+
+    subgraph Core Agent Logic (LangGraph)
+        InputGuardrails[Input Guardrails & Validation]
+        AgentState[Agent State (memory, context, tool history, intent)]
+        Router[Router/Planner Node (LLM-based decision)]
+        ToolExecutor[Tool Executor Node]
+        ToolOutputGuardrails[Tool Output Validation & Error Handling]
+        ResponseGenerator[Response Generation Node (LLM)]
+        OutputGuardrails[Output Guardrails (Content safety, formatting)]
+    end
+
+    subgraph Tools
+        Tool_Search[Search FAQ Tool (Robust error handling, clear description)]
+        Tool_Add[Add FAQ Tool (Input validation, confirmation?)]
+        Tool_Update[Update FAQ Tool (Input validation, confirmation?)]
+        Tool_Delete[Delete FAQ Tool (Confirmation required!)]
+        Tool_WebSearch[(Optional) Web Search Tool]
+        Tool_DocSearch[(Optional) Yandex Docs Search Tool]
+        %% ... potentially more tools
+    end
+
+    subgraph Data & Knowledge
+        DB[(Database: Supabase/Neon - Postgres)]
+        VectorStore{Vector Store (pgvector in DB)}
+        Config[Configuration (Prompts, API Keys, Settings)]
+    end
+
+    subgraph Monitoring & Logging
+        Logger[Logging Service]
+    end
+
+    %% Flow
+    UI_Input --> InputGuardrails
+    InputGuardrails -- Validated Input --> AgentState
+    AgentState --> Router
+    Router -- Decision: Use Tool --> ToolExecutor
+    Router -- Decision: Respond --> ResponseGenerator
+    ToolExecutor -- Selects & Prepares Tool --> Tools
+    Tools -- Tool Input --> ToolExecutor %% Implicit call
+    ToolExecutor -- Raw Tool Output --> ToolOutputGuardrails
+    ToolOutputGuardrails -- Validated Tool Result / Error --> AgentState
+    ResponseGenerator -- Generates Response --> OutputGuardrails
+    OutputGuardrails -- Safe Response --> UI_Output
+
+    %% State Updates & Logging
+    InputGuardrails -- Updates / Reads --> AgentState
+    ToolOutputGuardrails -- Updates --> AgentState
+    OutputGuardrails -- Updates --> AgentState
+    Router -- Reads --> AgentState
+    ToolExecutor -- Reads --> AgentState
+    ResponseGenerator -- Reads --> AgentState
+
+    InputGuardrails -- Logs --> Logger
+    Router -- Logs --> Logger
+    ToolExecutor -- Logs --> Logger
+    ToolOutputGuardrails -- Logs --> Logger
+    ResponseGenerator -- Logs --> Logger
+    OutputGuardrails -- Logs --> Logger
+    Tools -- Logs --> Logger
+
+    %% Data Access
+    Tools -- CRUD / Search --> DB
+    Tools -- Search / Update --> VectorStore
+    AgentState -- Reads --> Config
+    Router -- Reads --> Config
+    ResponseGenerator -- Reads --> Config
+    Tools -- Reads --> Config
+
+qa-telegram-agent/
+├── .env                  # Секреты: API ключи, токены, коннекшн стринг к БД
+├── .gitignore
+├── Dockerfile            # Для сборки Docker-образа
+├── docker-compose.yml    # (Опционально) Для запуска нескольких сервисов, если нужно
+├── requirements.txt      # Зависимости Python
+├── main.py               # Точка входа, запуск бота
+├── config.py             # Конфигурация (пути, настройки LLM и т.д.)
+├── agent/
+│   ├── __init__.py
+│   ├── agent_executor.py # Логика LangGraph агента
+│   ├── prompts.py        # Промпты для LLM
+│   ├── state.py          # Определение состояния агента
+│   └── tools/
+│       ├── __init__.py
+│       ├── base_tool.py  # (Опционально) Базовый класс для инструментов
+│       ├── search_faq.py # Инструмент поиска
+│       ├── add_faq.py    # Инструмент добавления
+│       ├── update_faq.py # Инструмент обновления
+│       └── delete_faq.py # Инструмент удаления
+├── database/
+│   ├── __init__.py
+│   ├── connection.py     # Установка соединения с БД (Supabase/Neon)
+│   ├── models.py         # (Опционально) SQLAlchemy модели для таблиц
+│   └── vector_store.py   # Логика взаимодействия с векторным хранилищем
+└── telegram_interface/
+    ├── __init__.py
+    └── handlers.py       # Обработчики сообщений Telegram 

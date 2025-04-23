@@ -1,0 +1,48 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Project Structure for QA Bot
+
+## Critical Rules
+- Соблюдай следующую структуру директорий верхнего уровня:
+  - `agent/`: Основная логика агента LangGraph, состояния, промпты, инструменты.
+  - `database/`: Код для взаимодействия с базой данных (Supabase/Neon) и векторным хранилищем.
+  - `telegram_interface/`: Код для взаимодействия с Telegram API (`python-telegram-bot`).
+  - `config/`: Файлы конфигурации (НЕ секреты), например, настройки логирования, параметры LLM.
+  - `core/` (или `common/`): Общие утилиты, базовые классы, используемые в разных частях проекта.
+  - `tests/`: Юнит-тесты и интеграционные тесты.
+- Файлы инструментов должны находиться в `agent/tools/`.
+- Промпты должны находиться в `agent/prompts.py` или отдельной папке `agent/prompts/`.
+- Обработчики Telegram должны находиться в `telegram_interface/handlers.py`.
+- Модели данных (например, Pydantic или SQLAlchemy) для БД должны быть в `database/models.py`.
+- Основной скрипт запуска (`main.py`), `Dockerfile`, `docker-compose.yml`, `requirements.txt`, `.env`, `.gitignore` должны находиться в корне проекта.
+
+## Examples
+<example>
+# Правильное размещение:
+qa-telegram-agent/
+├── agent/
+│   ├── __init__.py
+│   ├── agent_executor.py
+│   └── tools/
+│       └── search_faq.py
+├── database/
+│   ├── __init__.py
+│   └── connection.py
+├── telegram_interface/
+│   └── handlers.py
+├── main.py
+└── requirements.txt
+</example>
+
+<example type="invalid">
+# Неправильное размещение:
+qa-telegram-agent/
+├── agent_executor.py # Должен быть в agent/
+├── tools.py          # Инструменты должны быть в agent/tools/
+├── db_stuff.py       # Должен быть в database/
+├── bot.py            # Точка входа main.py, логика telegram в telegram_interface/
+└── requirements.txt
+</example> 
