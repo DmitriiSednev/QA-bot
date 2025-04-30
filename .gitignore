@@ -187,4 +187,25 @@ __pycache__/
 *.ntvs*
 *.njsproj
 *.sln
-*.sw? 
+*.sw?
+
+# Virtual Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Local development
+.DS_Store
+Thumbs.db 
