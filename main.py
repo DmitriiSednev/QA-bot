@@ -252,6 +252,34 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка в команде admin: {e}", exc_info=True)
         await message.reply_text("Произошла ошибка при выполнении команды")
 
+async def update_docs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /update_docs для обновления документации."""
+    message = update.message
+    user_id = message.from_user.id
+
+    # Проверяем, является ли пользователь админом
+    if str(user_id) not in ADMIN_USER_IDS_STR.split(","):
+        await message.reply_text("У вас нет прав для использования этой команды.")
+        return
+
+    try:
+        await message.reply_text("Начинаю обновление документации Yandex Cloud...")
+        
+        with connection.get_db_session() as db:
+            if not db:
+                await message.reply_text("Ошибка подключения к БД")
+                return
+                
+            from database.yandex_docs import YandexDocsManager
+            docs_manager = YandexDocsManager()
+            await docs_manager.update_docs(db)
+            
+        await message.reply_text("Документация успешно обновлена!")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении документации: {e}", exc_info=True)
+        await message.reply_text(f"Произошла ошибка при обновлении документации: {e}")
+
 def handle_shutdown(signum, frame):
     logger.info("Получен сигнал завершения, начинаем graceful shutdown...")
     sys.exit(0)
@@ -281,6 +309,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("update_docs", update_docs_command))
 
     # Добавляем планировщик очистки в асинхронный цикл событий
     application.job_queue.run_custom(callback=cleanup_scheduler, job_kwargs={"name": "faq_cleanup"})

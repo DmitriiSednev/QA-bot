@@ -1,6 +1,9 @@
 import logging
-from typing import List, Optional
+from typing import List, Optional, Dict
 import os  # Для переменных окружения
+from datetime import datetime, timedelta
+import numpy as np
+from functools import lru_cache
 
 from sqlalchemy.orm import Session
 from sqlalchemy import select, update as sql_update, delete as sql_delete, text
@@ -9,6 +12,7 @@ from langchain_openai import OpenAIEmbeddings  # Импортируем эмбе
 from pgvector.sqlalchemy import Vector  # Уже импортирован, но для ясности
 
 from . import models
+from .embeddings import get_embeddings
 
 logger = logging.getLogger(__name__)
 
@@ -265,3 +269,87 @@ def deactivate_admin(db: Session, user_id: int) -> bool:
         logger.error(f"Ошибка при деактивации админа user_id={user_id}: {e}", exc_info=True)
         db.rollback()
         return False
+
+
+class EmbeddingCache:
+    def __init__(self, max_size: int = 1000):
+        self._cache: Dict[str, np.ndarray] = {}
+        self._max_size = max_size
+
+    def get(self, text: str) -> Optional[np.ndarray]:
+        return self._cache.get(text)
+
+    def set(self, text: str, embedding: np.ndarray):
+        if len(self._cache) >= self._max_size:
+            # Удаляем самый старый элемент
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[text] = embedding
+
+    def clear(self):
+        self._cache.clear()
+
+embedding_cache = EmbeddingCache()
+
+def get_faq_entries(db: Session, limit: int = 10) -> List[models.FAQEntry]:
+    """Получение FAQ записей с кэшированием."""
+    return db.query(models.FAQEntry).order_by(models.FAQEntry.created_at.desc()).limit(limit).all()
+
+@lru_cache(maxsize=100)
+def get_admin_by_username(username: str) -> Optional[models.Admin]:
+    """Получение админа с кэшированием."""
+    with connection.get_db_session() as db:
+        return db.query(models.Admin).filter(models.Admin.username == username).first()
+
+def create_faq_entry(db: Session, question: str, answer: str, category: str) -> models.FAQEntry:
+    """Создание FAQ записи с оптимизированными эмбеддингами."""
+    # Проверяем кэш
+    cached_embedding = embedding_cache.get(question)
+    if cached_embedding is not None:
+        question_embedding = cached_embedding
+    else:
+        # Получаем эмбеддинги батчами
+        embeddings = get_embeddings([question])
+        question_embedding = embeddings[0]
+        embedding_cache.set(question, question_embedding)
+
+    entry = models.FAQEntry(
+        question=question,
+        answer=answer,
+        category=category,
+        question_embedding=question_embedding.tolist()
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+def search_similar_questions(db: Session, question: str, threshold: float = 0.7, limit: int = 5) -> List[models.FAQEntry]:
+    """Поиск похожих вопросов с оптимизированными эмбеддингами."""
+    # Проверяем кэш
+    cached_embedding = embedding_cache.get(question)
+    if cached_embedding is not None:
+        question_embedding = cached_embedding
+    else:
+        embeddings = get_embeddings([question])
+        question_embedding = embeddings[0]
+        embedding_cache.set(question, question_embedding)
+
+    # Используем векторный поиск
+    similar_entries = db.query(models.FAQEntry).filter(
+        models.FAQEntry.question_embedding.cosine_similarity(question_embedding) > threshold
+    ).order_by(
+        models.FAQEntry.question_embedding.cosine_similarity(question_embedding).desc()
+    ).limit(limit).all()
+
+    return similar_entries
+
+def cleanup_old_faq_entries(db: Session, days: int = 30) -> int:
+    """Очистка старых FAQ записей с оптимизацией."""
+    cutoff_date = datetime.now() - timedelta(days=days)
+    deleted = db.query(models.FAQEntry).filter(models.FAQEntry.created_at < cutoff_date).delete()
+    db.commit()
+    
+    # Очищаем кэш после удаления
+    embedding_cache.clear()
+    
+    return deleted

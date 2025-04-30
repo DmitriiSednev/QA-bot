@@ -1,5 +1,5 @@
-# Используем последнюю стабильную версию с фиксированным дайджестом
-FROM python:3.11-slim-bookworm@sha256:edaf703dce209d774af3ff768fc92b1e32fbba99789465f5bf49665f699a2d35 as builder
+# Используем последнюю стабильную версию
+FROM python:3.11-slim-bookworm as builder
 
 # Устанавливаем необходимые пакеты для сборки и обновляем систему
 RUN apt-get update && apt-get upgrade -y && \
@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir -U pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
 # Финальный этап
-FROM python:3.11-slim-bookworm@sha256:edaf703dce209d774af3ff768fc92b1e32fbba99789465f5bf49665f699a2d35
+FROM python:3.11-slim-bookworm
 
 # Устанавливаем обновления безопасности и необходимые пакеты
 RUN apt-get update && apt-get upgrade -y && \

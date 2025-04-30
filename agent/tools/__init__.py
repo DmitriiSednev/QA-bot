@@ -6,6 +6,7 @@ from .search_faq import SearchFAQTool
 from .update_faq import UpdateFAQTool
 from .web_search import WebSearchTool
 from .context_analyzer import ContextAnalyzerTool
+from .yandex_docs_search import YandexDocsSearchTool
 
 __all__ = [
     "AddFAQTool",
@@ -13,5 +14,6 @@ __all__ = [
     "SearchFAQTool",
     "UpdateFAQTool",
     "WebSearchTool",
-    "ContextAnalyzerTool"
+    "ContextAnalyzerTool",
+    "YandexDocsSearchTool"
 ]

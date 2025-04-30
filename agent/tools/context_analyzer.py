@@ -1,6 +1,9 @@
 import logging
-from typing import Type, Dict, Any, Optional
+from typing import Type, Dict, Any, Optional, List
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+import numpy as np
 
 from pydantic import BaseModel, Field
 from langchain_core.tools import BaseTool
@@ -141,4 +144,76 @@ class ContextAnalyzerTool(BaseTool):
             "complexity": complexity,
             "time_context": time_context,
             "reason": "Анализ контекста сообщения"
-        } 
+        }
+
+class ContextCache:
+    def __init__(self, max_size: int = 1000, ttl: int = 3600):
+        self._cache: Dict[str, Dict] = {}
+        self._max_size = max_size
+        self._ttl = ttl
+
+    def get(self, key: str) -> Optional[Dict]:
+        if key in self._cache:
+            entry = self._cache[key]
+            if datetime.now() - entry['timestamp'] < timedelta(seconds=self._ttl):
+                return entry['data']
+            del self._cache[key]
+        return None
+
+    def set(self, key: str, data: Dict):
+        if len(self._cache) >= self._max_size:
+            # Удаляем самый старый элемент
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[key] = {
+            'data': data,
+            'timestamp': datetime.now()
+        }
+
+    def clear(self):
+        self._cache.clear()
+
+context_cache = ContextCache()
+
+@lru_cache(maxsize=1000)
+def analyze_message(message: str) -> Dict:
+    """Анализ сообщения с кэшированием."""
+    # Проверяем кэш
+    cached_result = context_cache.get(message)
+    if cached_result is not None:
+        return cached_result
+
+    # Параллельная обработка различных аспектов сообщения
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        sentiment_future = executor.submit(_analyze_sentiment, message)
+        intent_future = executor.submit(_analyze_intent, message)
+        entities_future = executor.submit(_extract_entities, message)
+
+        result = {
+            'sentiment': sentiment_future.result(),
+            'intent': intent_future.result(),
+            'entities': entities_future.result(),
+            'timestamp': datetime.now()
+        }
+
+    # Сохраняем в кэш
+    context_cache.set(message, result)
+    return result
+
+def _analyze_sentiment(message: str) -> float:
+    """Анализ тональности сообщения."""
+    # Реализация анализа тональности
+    return 0.0
+
+def _analyze_intent(message: str) -> str:
+    """Анализ намерения в сообщении."""
+    # Реализация анализа намерения
+    return "unknown"
+
+def _extract_entities(message: str) -> List[str]:
+    """Извлечение сущностей из сообщения."""
+    # Реализация извлечения сущностей
+    return []
+
+def clear_context_cache():
+    """Очистка кэша контекста."""
+    context_cache.clear() 

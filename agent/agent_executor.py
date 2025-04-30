@@ -26,7 +26,7 @@ from langchain.agents.output_parsers import OpenAIFunctionsAgentOutputParser
 from .state import AgentState
 
 # --- Импорт инструментов ---
-from .tools import WebSearchTool, SearchFAQTool, AddFAQTool, UpdateFAQTool, DeleteFAQTool, ContextAnalyzerTool
+from .tools import WebSearchTool, SearchFAQTool, AddFAQTool, UpdateFAQTool, DeleteFAQTool, ContextAnalyzerTool, YandexDocsSearchTool
 
 # TODO: Импортировать другие инструменты (update_faq, delete_faq и т.д.)
 
@@ -38,6 +38,7 @@ tool_descriptions: Dict[str, str] = {
     "update_faq": "Изменить существующую запись в FAQ по её ID.",
     "delete_faq": "Удалить запись из FAQ по её ID.",
     "yandex_cloud_docs_search": "Искать информацию ИСКЛЮЧИТЕЛЬНО в официальной документации Yandex Cloud (yandex.cloud/ru/docs/). Использовать ТОЛЬКО для вопросов о Yandex Cloud, и ТОЛЬКО ЕСЛИ поиск по FAQ ('search_faq') не дал ответа (ВТОРОЙ ИСТОЧНИК).",
+    "yandex_docs_search": "Искать информацию в документации Yandex Cloud, включая технические детали API, параметры и описания. Может обрабатывать специальные форматы документации.",
 }
 
 # Реестр реальных объектов инструментов
@@ -47,8 +48,9 @@ tool_classes: List[Type[BaseTool]] = [
     AddFAQTool,
     UpdateFAQTool,
     DeleteFAQTool,
-    WebSearchTool, # Добавляем новый инструмент
+    WebSearchTool,
     ContextAnalyzerTool,
+    YandexDocsSearchTool,
 ]
 
 # Создаем экземпляры инструментов (можно передавать параметры конфигурации сюда, если нужно)
