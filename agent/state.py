@@ -26,3 +26,4 @@ class AgentState(TypedDict):
     faq_search_result: Optional[str] = None  # Результат поиска по FAQ
     current_tool_call_id: Optional[str] = None
     tool_name_executed: Optional[str] = None
+    user_id: Optional[int] = None

@@ -1,7 +1,11 @@
 import operator
 import os
 import functools
-from typing import Sequence, Literal
+import logging # Добавляем для логгирования ключей
+from typing import Sequence, Literal, Type
+
+# --- Настройка логгера для этого модуля ---
+logger = logging.getLogger(__name__)
 
 from langchain_core.messages import (
     BaseMessage,
@@ -10,15 +14,18 @@ from langchain_core.messages import (
     HumanMessage,
     ToolMessage,
 )
+# Возвращаем ChatOpenAI, так как используется OpenAI-совместимый прокси
 from langchain_openai import ChatOpenAI
+# from langchain_yandex import ChatYandexGPT # Убираем YandexGPT
 from langgraph.graph import END, StateGraph
 from langchain.prompts import ChatPromptTemplate
+from langchain_core.tools import BaseTool # Убедимся, что BaseTool импортирован
 
 from .state import AgentState
 
 # --- Импорт инструментов ---
-from .tools.web_search import WebSearchTool
-from .tools.search_faq import SearchFAQTool, SearchFAQInput
+from .tools.web_search import WebSearchTool as YandexCloudDocsSearchTool # Переименованный класс
+from .tools.search_faq import SearchFAQTool
 from .tools.add_faq import AddFAQTool
 from .tools.update_faq import UpdateFAQTool
 from .tools.delete_faq import DeleteFAQTool
@@ -28,15 +35,33 @@ from .tools.delete_faq import DeleteFAQTool
 # --- Определяем "инструменты" ---
 # Описания для LLM-роутера
 tool_descriptions = {
-    "search_faq": "Искать ответ на вопрос пользователя в базе знаний FAQ (предпочтительно для специфичных знаний проекта).",
+    "search_faq": "Искать ответ на вопрос пользователя ВНУТРИ базы знаний FAQ (ПЕРВЫЙ ИСТОЧНИК). Использовать для специфичных знаний проекта.",
     "add_faq": "Добавить новую пару вопрос-ответ в базу знаний FAQ.",
     "update_faq": "Изменить существующую запись в FAQ по её ID.",
     "delete_faq": "Удалить запись из FAQ по её ID.",
-    "web_search": "Искать актуальную информацию в интернете (использовать для общих знаний, фактов, новостей, когда FAQ не помог).",
+    "yandex_cloud_docs_search": "Искать информацию ИСКЛЮЧИТЕЛЬНО в официальной документации Yandex Cloud (yandex.cloud/ru/docs/). Использовать ТОЛЬКО для вопросов о Yandex Cloud, и ТОЛЬКО ЕСЛИ поиск по FAQ ('search_faq') не дал ответа (ВТОРОЙ ИСТОЧНИК).",
 }
 
 # Реестр реальных объектов инструментов
-tool_registry = {}
+# Используем классы напрямую для создания экземпляров
+tool_classes: list[Type[BaseTool]] = [
+    SearchFAQTool,
+    AddFAQTool,
+    UpdateFAQTool,
+    DeleteFAQTool,
+    YandexCloudDocsSearchTool, # Добавляем новый инструмент
+]
+
+# Создаем экземпляры инструментов (можно передавать параметры конфигурации сюда, если нужно)
+tool_registry = {tool_cls().name: tool_cls() for tool_cls in tool_classes}
+
+# Убедимся, что имена совпадают с ключами в tool_descriptions
+for name in tool_descriptions:
+    if name not in tool_registry:
+        logger.warning(f"Описание для инструмента '{name}' есть, но сам инструмент не найден в реестре.")
+for name in tool_registry:
+    if name not in tool_descriptions:
+        logger.warning(f"Инструмент '{name}' есть в реестре, но его описания нет в tool_descriptions.")
 
 # COMMAND_TOOLS = {"add_faq", "update_faq", "delete_faq"}
 
@@ -249,7 +274,7 @@ def handle_tool_result_node(state: AgentState):
 
 # ОБНОВЛЕННЫЙ ГЕНЕРАТОР ОТВЕТА: теперь основной источник контекста - история сообщений
 def response_generator_node(state: AgentState, llm):
-    """Генерирует финальный ответ, основываясь на всей истории сообщений (включая ToolMessage)."""
+    """Генерирует финальный ответ, основываясь на всей истории сообщений."""
     print("--- Вход в Response Generator ---")
     messages_for_llm = state["messages"]
     print(f"Сообщения для генерации: {messages_for_llm}")
@@ -257,13 +282,19 @@ def response_generator_node(state: AgentState, llm):
     # Контекст теперь полностью в messages_for_llm (включая ToolMessage)
     # Можно удалить старую логику добавления faq_result/tool_result как AIMessage
 
-    # Системный промпт (можно упростить, т.к. контекст уже в сообщениях)
-    # Или оставить строгим, чтобы он правильно интерпретировал ToolMessage
-    system_prompt = """Ты - полезный AI ассистент. Отвечай на последний вопрос пользователя ясно и по делу,
-учитывая всю предыдущую историю диалога, включая результаты вызова инструментов (ToolMessage). 
-Основывай свой ответ на результатах инструментов, если они релевантны.
-Если последний запрос был на выполнение действия (add/update/delete) и он выполнен успешно (видно из ToolMessage), 
-просто подтверди это кратко.
+    # Обновляем системный промпт с указанием приоритета источников
+    system_prompt = """Ты - полезный AI ассистент, отвечающий на вопросы пользователей.
+
+Приоритет источников информации:
+1.  Сначала используй результаты поиска по внутренней базе знаний FAQ (если был вызван инструмент 'search_faq'). Это самый достоверный источник для специфичных вопросов.
+2.  Если поиск по FAQ не дал ответа И вопрос касается Yandex Cloud, используй результаты поиска по официальной документации Yandex Cloud (если был вызван инструмент 'yandex_cloud_docs_search'). Помни, что доступ к документации может быть ограничен.
+3.  Не используй общие знания или поиск в интернете, если это не предусмотрено специальными инструментами (которых сейчас нет, кроме поиска по документации YC).
+
+Отвечай на последний вопрос пользователя ясно и по делу, учитывая всю предыдущую историю диалога и результаты вызова инструментов (ToolMessage).
+Основывай свой ответ на результатах инструментов, если они релевантны и доступны.
+Если результат поиска по документации недоступен или нерелевантен, так и скажи.
+Если последний запрос был на выполнение действия (add/update/delete) и он выполнен успешно (видно из ToolMessage), просто подтверди это кратко.
+Если пользователь спрашивает о твоем происхождении, создателях или о том, кто тебя сделал (независимо от формулировки), отвечай только: "Меня сделали в "YandexGPT"".
 """
     # Проверяем, есть ли системное сообщение, и добавляем/заменяем его
     if not messages_for_llm or not isinstance(messages_for_llm[0], SystemMessage):
@@ -362,71 +393,95 @@ def build_graph(llm):
 
 
 def setup_agent():
-    """Собирает и компилирует граф агента, инициализируя LLM и инструменты."""
+    """Инициализирует LLM и вызывает build_graph для получения скомпилированного агента."""
+    print("--- Настройка агента (через прокси) ---")
 
-    # Получаем API ключ и базовый URL из переменных окружения
-    # .env должен быть уже загружен в main.py
-    api_key = os.getenv("OPENAI_API_KEY")
-    base_url = os.getenv("OPENAI_API_BASE")
+    # Загрузка учетных данных для OpenAI-совместимого прокси из .env
+    # Эти переменные используются ChatOpenAI
+    proxy_api_key = os.getenv("API_KEY")
+    proxy_api_base = os.getenv("API_BASE")
 
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY не найден в переменных окружения.")
-    if not base_url:
-        raise ValueError("OPENAI_API_BASE не найден в переменных окружения.")
+    if not proxy_api_key:
+        logger.error("API_KEY для прокси не найден в переменных окружения!")
+        # Можно упасть или использовать заглушку
+        raise ValueError("API_KEY для прокси не установлен")
 
-    # Инициализируем LLM (используя langchain_openai для совместимости)
-    # Добавляем таймаут, чтобы избежать зависаний
+    if not proxy_api_base:
+        logger.error("API_BASE для прокси не найден в переменных окружения!")
+        raise ValueError("API_BASE для прокси не установлен")
+
+    # Инициализация модели через ChatOpenAI, но с указанием proxy_api_base
     llm = ChatOpenAI(
-        api_key=api_key, base_url=base_url, request_timeout=60  # Таймаут в 60 секунд
+        openai_api_key=proxy_api_key,
+        openai_api_base=proxy_api_base,
+        model_name="yandex/yandexgpt/rc",
+        temperature=0.1,
+        max_tokens=2000,
+        request_timeout=60
     )
-    # TODO: Добавить обработку ошибок инициализации LLM?
+    print(f"Используется модель LLM: {llm.__class__.__name__} через прокси {proxy_api_base}")
 
-    # --- Инициализация Инструментов ---
-    tool_registry.clear()
+    # --- Получение скомпилированного графа --- 
+    # build_graph уже возвращает скомпилированный app
+    compiled_app = build_graph(llm) 
 
-    # Web Search Tool
+    # Убираем повторную компиляцию:
+    # app = graph.compile() 
+    print("--- Агент собран и скомпилирован ---")
+    return compiled_app # Возвращаем результат build_graph
+
+
+# --- Основная функция вызова агента ---
+# (остается без изменений, т.к. работает с скомпилированным app)
+
+# --- Запуск, если файл выполняется напрямую (для тестов) ---
+if __name__ == "__main__":
+    # Настройка логирования для теста
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logger.info("Запуск agent_executor как основного скрипта для теста.")
+
+    # Загрузка переменных окружения (нужен python-dotenv)
     try:
-        web_search_tool = WebSearchTool()
-        tool_registry[web_search_tool.name] = web_search_tool
-        print(f"Инструмент '{web_search_tool.name}' инициализирован.")
-    except Exception as e:
-        print(f"Ошибка при инициализации WebSearchTool: {e}")
+        from dotenv import load_dotenv
+        load_dotenv()
+        logger.info(".env файл загружен.")
+    except ImportError:
+        logger.warning("python-dotenv не установлен. Переменные окружения должны быть установлены вручную.")
 
-    # Search FAQ Tool
-    try:
-        search_faq_tool = SearchFAQTool()
-        tool_registry[search_faq_tool.name] = search_faq_tool
-        print(f"Инструмент '{search_faq_tool.name}' инициализирован.")
-    except Exception as e:
-        print(f"Ошибка при инициализации SearchFAQTool: {e}")
+    # Настройка и получение скомпилированного агента
+    compiled_agent = setup_agent()
 
-    # Add FAQ Tool
-    try:
-        add_faq_tool = AddFAQTool()
-        tool_registry[add_faq_tool.name] = add_faq_tool
-        print(f"Инструмент '{add_faq_tool.name}' инициализирован.")
-    except Exception as e:
-        print(f"Ошибка при инициализации AddFAQTool: {e}")
+    # Пример вызова агента (имитация ввода пользователя)
+    # Убедитесь, что у вас есть .env файл с API_KEY и др.
+    if os.getenv("API_KEY") and os.getenv("API_BASE"):
+        print("\n--- Тестовый вызов агента (через прокси) ---")
+        config = {"configurable": {"thread_id": "test-thread-1"}}
+        user_input = "Что такое Yandex Managed Service for Kubernetes?"
 
-    # Update FAQ Tool
-    try:
-        update_faq_tool = UpdateFAQTool()
-        tool_registry[update_faq_tool.name] = update_faq_tool
-        print(f"Инструмент '{update_faq_tool.name}' инициализирован.")
-    except Exception as e:
-        print(f"Ошибка при инициализации UpdateFAQTool: {e}")
+        # Используем stream для получения событий
+        events = compiled_agent.stream(
+            {"messages": [HumanMessage(content=user_input)]}, config=config
+        )
 
-    # Delete FAQ Tool
-    try:
-        delete_faq_tool = DeleteFAQTool()
-        tool_registry[delete_faq_tool.name] = delete_faq_tool
-        print(f"Инструмент '{delete_faq_tool.name}' инициализирован.")
-    except Exception as e:
-        print(f"Ошибка при инициализации DeleteFAQTool: {e}")
+        print(f"Ввод пользователя: {user_input}")
+        print("Ответ агента:")
+        final_response = None
+        for event in events:
+            # Печатаем события для отладки
+            print(f"Event: {event}")
+            # Ищем финальный ответ в событии 'response_generator'
+            # (Предполагая, что узел называется 'response_generator' и возвращает AIMessage в 'messages')
+            if event.get("event") == "on_chain_end" and event.get("name") == "response_generator":
+                 # Получаем последнее сообщение из состояния на выходе узла
+                 output_messages = event.get("data", {}).get("output", {}).get("messages", [])
+                 if output_messages and isinstance(output_messages[-1], AIMessage):
+                     final_response = output_messages[-1].content
 
-    if not tool_registry:
-        print("Внимание: Ни один инструмент не был успешно инициализирован!")
-
-    # --- Сборка Графа ---
-    app = build_graph(llm)  # Использует обновленный build_graph
-    return app
+        print("\n--- Финальный ответ ---")
+        if final_response:
+            print(final_response)
+        else:
+            print("Не удалось получить финальный ответ от агента.")
+        print("--- Тестовый вызов завершен ---")
+    else:
+        print("Пропуск тестового вызова: API_KEY или API_BASE для прокси не установлены.")

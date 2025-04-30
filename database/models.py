@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text
+from sqlalchemy import Column, Integer, String, Text, DateTime, func
 from sqlalchemy.orm import declarative_base, sessionmaker
 from pgvector.sqlalchemy import Vector
 
@@ -15,9 +15,9 @@ class FAQEntry(Base):
     question = Column(Text, nullable=False, index=True)  # Индекс по вопросу для поиска
     answer = Column(Text, nullable=False)
     embedding = Column(Vector(1536), nullable=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
 
     # Дополнительные поля, которые можно добавить позже:
-    # created_at = Column(DateTime(timezone=True), server_default=func.now())
     # updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     # source = Column(String(255))
 

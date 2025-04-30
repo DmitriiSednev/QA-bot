@@ -1,0 +1,52 @@
+# Git
+.git
+.gitignore
+
+# Python Virtual Environment
+.venv
+
+# IDE / Editor specific
+.idea
+.vscode
+.cursor
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Logs (если они случайно попадут в корень)
+*.log
+
+# Env files (они монтируются через docker-compose, не копируются)
+.env
+.env.*
+!.env.example
+
+# Docker / Compose files (не нужны внутри образа)
+Dockerfile
+docker-compose.yml
+
+# Test files (если есть)
+tests/
+*.test.py
+pytest.ini
+.pytest_cache/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Other potentially large/unneeded files
+notebooks/
+*.ipynb
+data/
+*.csv
+*.json # Будь осторожен, если JSON нужен для работы
+*.xml 

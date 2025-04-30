@@ -13,23 +13,27 @@ from . import models
 logger = logging.getLogger(__name__)
 
 # --- Инициализация Эмбеддера ---
-# Использует OPENAI_API_KEY и OPENAI_API_BASE из .env
+# Используем API_KEY и API_BASE из .env, как и для основного LLM
 try:
     # Убедимся, что нужные переменные есть
-    if not os.getenv("OPENAI_API_KEY") or not os.getenv("OPENAI_API_BASE"):
+    # Используем те же имена переменных, что и для основного LLM прокси
+    api_key_for_embeddings = os.getenv("API_KEY")
+    api_base_for_embeddings = os.getenv("API_BASE")
+    if not api_key_for_embeddings or not api_base_for_embeddings:
         raise ValueError(
-            "API ключ или базовый URL OpenAI не найдены в .env для эмбеддингов"
+            "API_KEY или API_BASE не найдены в .env для эмбеддингов (используются те же, что и для LLM)"
         )
     embeddings_model = OpenAIEmbeddings(
-        # Можно указать конкретную модель, если нужно, иначе по умолчанию
-        # model="text-embedding-ada-002"
-        openai_api_key=os.environ["OPENAI_API_KEY"],
-        openai_api_base=os.environ["OPENAI_API_BASE"],
+        openai_api_key=api_key_for_embeddings,  # Передаем API_KEY
+        openai_api_base=api_base_for_embeddings, # Передаем API_BASE
+        # Можно указать модель эмбеддингов, если прокси ее поддерживает и она отличается от дефолтной
+        # model="text-embedding-ada-002",
+        request_timeout=30 # Таймаут для эмбеддингов
     )
-    logger.info("Модель эмбеддингов OpenAI инициализирована.")
+    logger.info("Модель эмбеддингов инициализирована (через прокси).")
 except Exception as e:
-    logger.error(f"Ошибка инициализации модели эмбеддингов: {e}", exc_info=True)
-    embeddings_model = None  # Устанавливаем в None, чтобы CRUD функции могли проверить
+    logger.error(f"Ошибка инициализации модели эмбеддингов (через прокси): {e}", exc_info=True)
+    embeddings_model = None
 
 
 def _get_embedding(text: str) -> Optional[List[float]]:
@@ -193,3 +197,21 @@ def delete_faq_entry(db: Session, entry_id: int) -> bool:
         logger.error(f"Ошибка при удалении FAQ ID={entry_id}: {e}", exc_info=True)
         db.rollback()
         return False
+
+
+def cleanup_old_faq_entries(db: Session, days: int = 365) -> int:
+    """Удаляет записи FAQ старше указанного количества дней."""
+    try:
+        # Используем text() для прямого SQL запроса с интервалом
+        stmt = sql_delete(models.FAQEntry).where(
+            models.FAQEntry.created_at < text(f"NOW() - INTERVAL '{days} days'")
+        )
+        result = db.execute(stmt)
+        db.commit()
+        deleted_count = result.rowcount
+        logger.info(f"Удалено {deleted_count} записей FAQ старше {days} дней.")
+        return deleted_count
+    except Exception as e:
+        logger.error(f"Ошибка при очистке старых FAQ записей: {e}", exc_info=True)
+        db.rollback()
+        return 0
