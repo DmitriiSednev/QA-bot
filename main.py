@@ -1,11 +1,12 @@
 import asyncio
 import logging
 import os
-import re  # Импортируем regex для парсинга
 import sys
-from datetime import timedelta
-import io # Для работы с байтами изображения
-import easyocr # Для распознавания текста
+from datetime import datetime
+import io
+import easyocr
+import signal
+from typing import Optional, Dict, Any, List, Union
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -19,28 +20,25 @@ from telegram.ext import (
 )
 
 # --- Import Agent Logic ---
-from agent.agent_executor import setup_agent  # AgentState не нужен напрямую
-from langgraph.graph.message import AnyMessage  # Для типизации
+from agent.agent_executor import setup_agent
+from langgraph.graph.message import AnyMessage
 from langchain_core.messages import HumanMessage, AIMessage
-
-# --- Инструменты больше не импортируем и не вызываем напрямую ---
-# from agent.tools.add_faq import AddFAQTool, AddFAQInput
-# from agent.tools.update_faq import UpdateFAQTool, UpdateFAQInput
-# from agent.tools.delete_faq import DeleteFAQTool, DeleteFAQInput
+from database import connection, crud
 
 # --- Конфигурация логирования --- #
-LOG_DIR = "/app/logs"  # Путь внутри контейнера
+LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "bot.log")
 
 # Создаем директорию логов, если ее нет
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout),  # Вывод в консоль контейнера
-        logging.FileHandler(LOG_FILE),  # Запись в файл
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(LOG_FILE)
     ]
 )
 logger = logging.getLogger(__name__)
@@ -64,15 +62,12 @@ if not TELEGRAM_BOT_TOKEN:
     sys.exit(1)
 
 # --- Инициализация OCR --- #
-# Инициализируем один раз при старте (может занять время при первом запуске)
 OCR_READER = None
 try:
-    # Указываем языки: русский и английский
-    OCR_READER = easyocr.Reader(['ru', 'en'], gpu=False) # Используем CPU
+    OCR_READER = easyocr.Reader(['ru', 'en'], gpu=False)
     logger.info("OCR Reader (easyocr) инициализирован для языков [ru, en].")
 except Exception as e:
     logger.error(f"Ошибка инициализации OCR Reader: {e}", exc_info=True)
-    # Бот продолжит работать, но не сможет обрабатывать картинки
 
 # --- Инициализация Агента LangGraph --- #
 try:
@@ -82,16 +77,17 @@ except Exception as e:
     sys.exit(1)
 
 # --- Вспомогательная функция для вызова агента ---
-async def run_agent_for_user(user_id: int, chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE):
+async def run_agent_for_user(user_id: int, chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"Вызов агента для user {user_id} в чате {chat_id}, текст: '{text}'")
     thread_id = f"telegram_{chat_id}" 
-    config = {"configurable": {"thread_id": thread_id}}
-    # Передаем и сообщение, и user_id
-    inputs = {"messages": [HumanMessage(content=text)], "user_id": user_id}
-    final_response = "Извините, я не смог обработать ваш запрос." # Ответ по умолчанию
+    config: Dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+    inputs: Dict[str, Union[List[HumanMessage], int]] = {
+        "messages": [HumanMessage(content=text)], 
+        "user_id": user_id
+    }
+    final_response: str = "Извините, я не смог обработать ваш запрос."
 
     try:
-        # Используем ainvoke для простоты получения финального ответа
         final_state = await agent_app.ainvoke(inputs, config=config)
         final_messages: list[AnyMessage] = final_state.get("messages", [])
         if final_messages and isinstance(final_messages[-1], AIMessage):
@@ -118,14 +114,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message_text:
         return
 
-    # 1. Проверка на "кто тебя сделал?"
-    # Проверка на 'кто тебя сделал?' теперь будет внутри LLM (системный промпт)
-    # if cleaned_text == "кто тебя сделал?":
-    #     logger.info(f"Ответ на '{cleaned_text}' в чате {chat_id}")
-    #     await message.reply_text("Меня сделали в \"YandexGPT\"")
-    #     return
-
-    # 2. Проверка, нужно ли боту отвечать (в личке или если упомянули/ответили)
+    # Проверка, нужно ли боту отвечать
     should_respond = False
     if message.chat.type == "private":
         should_respond = True
@@ -144,9 +133,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Сообщение является ответом на сообщение бота в чате {chat_id}.")
 
     if not should_respond:
-        return # Игнорируем сообщение
+        return
 
-    # Вызываем общую функцию для запуска агента
     await run_agent_for_user(user_id, chat_id, message_text, context)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -163,13 +151,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        # Берем фото лучшего качества
         photo_file = await message.photo[-1].get_file()
-        # Скачиваем в память
         file_bytes = await photo_file.download_as_bytearray()
         image_bytes = bytes(file_bytes)
 
-        # Распознаем текст
         ocr_result = OCR_READER.readtext(image_bytes)
 
         if not ocr_result:
@@ -177,19 +162,102 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("Не удалось распознать текст на этом изображении.")
             return
 
-        # Собираем распознанный текст
         extracted_text = " ".join([res[1] for res in ocr_result])
         logger.info(f"Распознанный текст: {extracted_text[:200]}...")
 
-        # Формируем сообщение для агента
         agent_input_text = f"Пользователь прислал картинку. Распознанный текст с картинки: '{extracted_text}'. Проанализируй этот текст или ответь на вопрос, если он есть в тексте."
         
-        # Вызываем агента с распознанным текстом
         await run_agent_for_user(user_id, chat_id, agent_input_text, context)
 
     except Exception as e:
         logger.error(f"Ошибка при обработке фото от user {user_id} в чате {chat_id}: {e}", exc_info=True)
         await message.reply_text("Произошла ошибка при обработке изображения.")
+
+async def cleanup_scheduler():
+    """Планировщик для очистки старых FAQ записей."""
+    while True:
+        logger.info("Запуск планового удаления старых FAQ записей...")
+        try:
+            with connection.get_db_session() as db:
+                if db:
+                    deleted = crud.cleanup_old_faq_entries(db)
+                    logger.info(f"Удалено {deleted} старых FAQ записей")
+                else:
+                    logger.error("Не удалось получить сессию БД для очистки")
+        except Exception as e:
+            logger.error(f"Ошибка при выполнении очистки: {e}", exc_info=True)
+        
+        await asyncio.sleep(24 * 60 * 60)  # 24 часа в секундах
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /admin для управления админами."""
+    message = update.message
+    user_id = message.from_user.id
+    username = message.from_user.username
+
+    # Проверяем, является ли пользователь супер-админом (из .env)
+    if str(user_id) not in ADMIN_USER_IDS_STR.split(","):
+        await message.reply_text("У вас нет прав для использования этой команды.")
+        return
+
+    # Получаем аргументы команды
+    args = context.args
+    if not args:
+        await message.reply_text("Использование: /admin add|remove|list user_id")
+        return
+
+    action = args[0].lower()
+    
+    try:
+        with connection.get_db_session() as db:
+            if not db:
+                await message.reply_text("Ошибка подключения к БД")
+                return
+
+            if action == "list":
+                admins = crud.get_all_active_admins(db)
+                if not admins:
+                    await message.reply_text("Список админов пуст")
+                    return
+                admin_list = "\n".join([f"ID: {admin.user_id}, Username: @{admin.username or 'N/A'}" for admin in admins])
+                await message.reply_text(f"Список активных админов:\n{admin_list}")
+                return
+
+            if len(args) < 2:
+                await message.reply_text("Необходимо указать user_id")
+                return
+
+            try:
+                target_user_id = int(args[1])
+            except ValueError:
+                await message.reply_text("user_id должен быть числом")
+                return
+
+            if action == "add":
+                if crud.add_admin(db, target_user_id):
+                    await message.reply_text(f"Админ {target_user_id} успешно добавлен")
+                else:
+                    await message.reply_text("Ошибка при добавлении админа")
+
+            elif action == "remove":
+                if crud.deactivate_admin(db, target_user_id):
+                    await message.reply_text(f"Админ {target_user_id} деактивирован")
+                else:
+                    await message.reply_text("Админ не найден или уже деактивирован")
+
+            else:
+                await message.reply_text("Неизвестное действие. Используйте: add, remove или list")
+
+    except Exception as e:
+        logger.error(f"Ошибка в команде admin: {e}", exc_info=True)
+        await message.reply_text("Произошла ошибка при выполнении команды")
+
+def handle_shutdown(signum, frame):
+    logger.info("Получен сигнал завершения, начинаем graceful shutdown...")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
 
 # --- Точка входа --- #
 def main():
@@ -211,8 +279,8 @@ def main():
     # Добавляем обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    # Добавляем обработчик для фото
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo)) 
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(CommandHandler("admin", admin_command))
 
     # Добавляем планировщик очистки в асинхронный цикл событий
     application.job_queue.run_custom(callback=cleanup_scheduler, job_kwargs={"name": "faq_cleanup"})

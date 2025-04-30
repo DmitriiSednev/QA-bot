@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, func
+from sqlalchemy import Column, Integer, String, Text, DateTime, func, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker
 from pgvector.sqlalchemy import Vector
 
@@ -23,6 +23,21 @@ class FAQEntry(Base):
 
     def __repr__(self):
         return f"<FAQEntry(id={self.id}, question='{self.question[:50]}...')>"
+
+
+class Admin(Base):
+    """Модель SQLAlchemy для таблицы администраторов."""
+
+    __tablename__ = "admins"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, unique=True, nullable=False, index=True)  # Telegram user_id
+    username = Column(String(255), nullable=True)  # Telegram username
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+
+    def __repr__(self):
+        return f"<Admin(id={self.id}, user_id={self.user_id}, username='{self.username}')>"
 
 
 # Если engine и SessionLocal определены здесь, оставляем их

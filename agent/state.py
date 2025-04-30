@@ -1,29 +1,40 @@
-from typing import TypedDict, Annotated, Sequence, Optional, Dict, Any
+from typing import TypedDict, Annotated, Sequence, Optional, Dict, Any, List
 import operator
+from datetime import datetime
 
 from langchain_core.messages import BaseMessage
 
 
+class MessageContext(TypedDict):
+    """Контекст сообщения для анализа."""
+    chat_type: str  # private, group, supergroup
+    is_mentioned: bool
+    is_reply_to_bot: bool
+    message_time: datetime
+    chat_id: int
+    user_id: int
+    username: Optional[str]
+    message_text: str
+    previous_messages: List[Dict[str, Any]]  # История последних сообщений
+
+
 class AgentState(TypedDict):
-    """Определяет состояние графа LangGraph для QA-бота.
-
-    Attributes:
-        messages: История сообщений диалога. Использует operator.add для накопления.
-        # Дополнительные поля могут быть добавлены позже:
-        # - context: Дополнительный контекст из RAG или инструментов.
-        # - plan: План действий, сгенерированный планировщиком.
-        # - tool_result: Результат последнего вызванного инструмента.
-        # - next_node: Указание на следующий узел для условных переходов.
-    """
-
+    """Определяет состояние графа LangGraph для QA-бота."""
     messages: Annotated[Sequence[BaseMessage], operator.add]
-
-    # Поля для управления потоком и инструментами
-    next_node: Optional[str] = None
-    tool_to_call: Optional[str] = None
-    tool_input: Optional[Dict[str, Any]] = None
-    tool_result: Optional[Any] = None  # Может быть строка или другой объект
-    faq_search_result: Optional[str] = None  # Результат поиска по FAQ
-    current_tool_call_id: Optional[str] = None
-    tool_name_executed: Optional[str] = None
-    user_id: Optional[int] = None
+    context: Optional[MessageContext]
+    should_respond: bool
+    confidence: float
+    last_response_time: Optional[datetime]
+    conversation_history: List[Dict[str, Any]]
+    current_tool: Optional[str]
+    tool_history: List[Dict[str, Any]]
+    error_count: int
+    retry_count: int
+    next_node: Optional[str]
+    tool_to_call: Optional[str]
+    tool_input: Optional[Dict[str, Any]]
+    tool_result: Optional[Any]
+    faq_search_result: Optional[str]
+    current_tool_call_id: Optional[str]
+    tool_name_executed: Optional[str]
+    user_id: Optional[int]

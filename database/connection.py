@@ -1,6 +1,7 @@
 import os
 import logging
 from contextlib import contextmanager
+from typing import Optional, Generator, Any, Union, ContextManager
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
@@ -35,7 +36,7 @@ else:
 
 
 @contextmanager
-def get_db_session() -> Session | None:
+def get_db_session() -> Generator[Optional[Session], None, None]:
     """Предоставляет сессию SQLAlchemy для работы с БД.
 
     Используется как менеджер контекста:
@@ -71,7 +72,7 @@ def get_db_session() -> Session | None:
 
 
 # Дополнительная функция для проверки доступности БД (опционально)
-def check_db_connection():
+def check_db_connection() -> bool:
     """Проверяет, можно ли установить соединение с БД."""
     if not engine:
         logger.warning("Проверка соединения: Engine не инициализирован.")
@@ -81,8 +82,8 @@ def check_db_connection():
             logger.info("Проверка соединения с БД: Успешно.")
             return True
     except SQLAlchemyError as e:
-        logger.error(f"Проверка соединения с БД: Ошибка - {e}")
+        logger.error(f"Проверка соединения с БД: Ошибка - {e}", exc_info=True)
         return False
     except Exception as e:
-        logger.error(f"Проверка соединения с БД: Неожиданная ошибка - {e}")
+        logger.error(f"Проверка соединения с БД: Неожиданная ошибка - {e}", exc_info=True)
         return False

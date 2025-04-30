@@ -24,11 +24,14 @@ try:
             "API_KEY или API_BASE не найдены в .env для эмбеддингов (используются те же, что и для LLM)"
         )
     embeddings_model = OpenAIEmbeddings(
-        openai_api_key=api_key_for_embeddings,  # Передаем API_KEY
-        openai_api_base=api_base_for_embeddings, # Передаем API_BASE
-        # Можно указать модель эмбеддингов, если прокси ее поддерживает и она отличается от дефолтной
-        # model="text-embedding-ada-002",
-        request_timeout=30 # Таймаут для эмбеддингов
+        openai_api_key=api_key_for_embeddings,
+        openai_api_base=api_base_for_embeddings,
+        model="text-embedding-ada-002",  # Можно оставить эту модель для эмбеддингов
+        request_timeout=30,
+        headers={
+            "HTTP-Referer": "https://github.com/DmitriiSednev/QA-bot",
+            "X-Title": "QA Telegram Bot"
+        }
     )
     logger.info("Модель эмбеддингов инициализирована (через прокси).")
 except Exception as e:
@@ -215,3 +218,50 @@ def cleanup_old_faq_entries(db: Session, days: int = 365) -> int:
         logger.error(f"Ошибка при очистке старых FAQ записей: {e}", exc_info=True)
         db.rollback()
         return 0
+
+
+def get_admin_by_user_id(db: Session, user_id: int) -> Optional[models.Admin]:
+    """Получает админа по его Telegram user_id."""
+    try:
+        return db.query(models.Admin).filter(models.Admin.user_id == user_id).first()
+    except Exception as e:
+        logger.error(f"Ошибка при получении админа по user_id={user_id}: {e}", exc_info=True)
+        return None
+
+
+def add_admin(db: Session, user_id: int, username: Optional[str] = None) -> Optional[models.Admin]:
+    """Добавляет нового админа."""
+    try:
+        admin = models.Admin(user_id=user_id, username=username)
+        db.add(admin)
+        db.commit()
+        db.refresh(admin)
+        return admin
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении админа user_id={user_id}: {e}", exc_info=True)
+        db.rollback()
+        return None
+
+
+def get_all_active_admins(db: Session) -> List[models.Admin]:
+    """Получает список всех активных админов."""
+    try:
+        return db.query(models.Admin).filter(models.Admin.is_active == True).all()
+    except Exception as e:
+        logger.error(f"Ошибка при получении списка админов: {e}", exc_info=True)
+        return []
+
+
+def deactivate_admin(db: Session, user_id: int) -> bool:
+    """Деактивирует админа."""
+    try:
+        admin = get_admin_by_user_id(db, user_id)
+        if admin:
+            admin.is_active = False
+            db.commit()
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Ошибка при деактивации админа user_id={user_id}: {e}", exc_info=True)
+        db.rollback()
+        return False

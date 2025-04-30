@@ -2,7 +2,7 @@ import operator
 import os
 import functools
 import logging # Добавляем для логгирования ключей
-from typing import Sequence, Literal, Type
+from typing import Sequence, Literal, Type, Dict, Any, Optional, List, Union, Generator, Callable
 
 # --- Настройка логгера для этого модуля ---
 logger = logging.getLogger(__name__)
@@ -17,24 +17,22 @@ from langchain_core.messages import (
 # Возвращаем ChatOpenAI, так как используется OpenAI-совместимый прокси
 from langchain_openai import ChatOpenAI
 # from langchain_yandex import ChatYandexGPT # Убираем YandexGPT
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END, StateGraph, CompiledGraph
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.tools import BaseTool # Убедимся, что BaseTool импортирован
+from langchain.agents import create_openai_functions_agent
+from langchain.agents.output_parsers import OpenAIFunctionsAgentOutputParser
 
 from .state import AgentState
 
 # --- Импорт инструментов ---
-from .tools.web_search import WebSearchTool as YandexCloudDocsSearchTool # Переименованный класс
-from .tools.search_faq import SearchFAQTool
-from .tools.add_faq import AddFAQTool
-from .tools.update_faq import UpdateFAQTool
-from .tools.delete_faq import DeleteFAQTool
+from .tools import WebSearchTool, SearchFAQTool, AddFAQTool, UpdateFAQTool, DeleteFAQTool, ContextAnalyzerTool
 
 # TODO: Импортировать другие инструменты (update_faq, delete_faq и т.д.)
 
 # --- Определяем "инструменты" ---
 # Описания для LLM-роутера
-tool_descriptions = {
+tool_descriptions: Dict[str, str] = {
     "search_faq": "Искать ответ на вопрос пользователя ВНУТРИ базы знаний FAQ (ПЕРВЫЙ ИСТОЧНИК). Использовать для специфичных знаний проекта.",
     "add_faq": "Добавить новую пару вопрос-ответ в базу знаний FAQ.",
     "update_faq": "Изменить существующую запись в FAQ по её ID.",
@@ -44,16 +42,17 @@ tool_descriptions = {
 
 # Реестр реальных объектов инструментов
 # Используем классы напрямую для создания экземпляров
-tool_classes: list[Type[BaseTool]] = [
+tool_classes: List[Type[BaseTool]] = [
     SearchFAQTool,
     AddFAQTool,
     UpdateFAQTool,
     DeleteFAQTool,
-    YandexCloudDocsSearchTool, # Добавляем новый инструмент
+    WebSearchTool, # Добавляем новый инструмент
+    ContextAnalyzerTool,
 ]
 
 # Создаем экземпляры инструментов (можно передавать параметры конфигурации сюда, если нужно)
-tool_registry = {tool_cls().name: tool_cls() for tool_cls in tool_classes}
+tool_registry: Dict[str, BaseTool] = {tool_cls().name: tool_cls() for tool_cls in tool_classes}
 
 # Убедимся, что имена совпадают с ключами в tool_descriptions
 for name in tool_descriptions:
@@ -66,78 +65,65 @@ for name in tool_registry:
 # COMMAND_TOOLS = {"add_faq", "update_faq", "delete_faq"}
 
 
-def input_guardrails_node(state: AgentState):
-    """(Заглушка) Проверяет входные данные.
-    В будущем здесь будет логика Input Guardrails.
-    """
-    print("--- Вход в Input Guardrails ---")
-    # TODO: Реализовать логику проверки ввода
-    return {}
+def input_guardrails_node(state: AgentState) -> Dict[str, Any]:
+    """Проверяет входные данные."""
+    logger.info("--- Вход в Input Guardrails ---")
+    try:
+        # TODO: Реализовать логику проверки ввода
+        return {}
+    except Exception as e:
+        logger.error(f"Ошибка в input_guardrails_node: {e}", exc_info=True)
+        return {"error": str(e)}
 
 
 # ---- НОВЫЙ УМНЫЙ РОУТЕР ----
-def router_node(state: AgentState, llm):
+def router_node(state: AgentState, llm: ChatOpenAI) -> Dict[str, Any]:
     """Анализирует сообщение пользователя и решает, какой инструмент вызвать или генерировать ответ."""
-    print("--- Вход в Умный Роутер ---")
-    messages = state["messages"]
-    last_message = messages[-1]
-    print(f"Последнее сообщение для роутера: {last_message.content}")
-
-    # Привязываем инструменты к LLM
-    llm_with_tools = llm.bind_tools(list(tool_registry.values()))
-
-    # Формируем промпт для роутера (можно сделать более сложным при необходимости)
-    # Пока просто передаем историю сообщений
-    # Важно: Если последний ToolMessage, LLM должна генерировать ответ, а не вызывать инструмент снова.
-    # Добавим проверку на это.
-    if isinstance(last_message, ToolMessage):
-        print(
-            "Последнее сообщение - результат инструмента. Переход к генерации ответа."
-        )
-        return {"next_node": "generate_response"}
-
-    print("Запрос к LLM-роутеру с привязанными инструментами...")
+    logger.info("--- Вход в Умный Роутер ---")
     try:
-        # Вызываем LLM, которая может решить вызвать инструмент
+        messages = state["messages"]
+        last_message = messages[-1]
+        logger.info(f"Последнее сообщение для роутера: {last_message.content}")
+
+        # Привязываем инструменты к LLM
+        llm_with_tools = llm.bind_tools(list(tool_registry.values()))
+
+        if isinstance(last_message, ToolMessage):
+            logger.info("Последнее сообщение - результат инструмента. Переход к генерации ответа.")
+            return {"next_node": "generate_response"}
+
+        logger.info("Запрос к LLM-роутеру с привязанными инструментами...")
         ai_message = llm_with_tools.invoke(messages)
-        print(f"Ответ LLM-роутера: {ai_message}")
+        logger.info(f"Ответ LLM-роутера: {ai_message}")
 
         if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-            # Если LLM не вызвала инструмент, генерируем ответ напрямую
-            print("Router node: LLM не выбрала инструмент.")  # Отладка
+            logger.info("Router node: LLM не выбрала инструмент.")
             return {
                 "next_node": "generate_response",
                 "messages": state["messages"] + [ai_message],
             }
 
-        # Если LLM вызвала инструмент
-        # Берем ПЕРВЫЙ вызов инструмента (для простоты)
         tool_call = ai_message.tool_calls[0]
         tool_name = tool_call["name"]
         tool_input = tool_call["args"]
         tool_call_id = tool_call.get("id")
 
-        print(f"LLM выбрала инструмент: '{tool_name}' с аргументами: {tool_input}")
-        print(f"Router node: Извлеченный tool_call_id: {tool_call_id}")
-
-        # Добавляем сообщение AI с запросом на вызов инструмента в историю
-        # УДАЛЯЕМ ручное добавление: state["messages"] += [ai_message]
+        logger.info(f"LLM выбрала инструмент: '{tool_name}' с аргументами: {tool_input}")
+        logger.info(f"Router node: Извлеченный tool_call_id: {tool_call_id}")
 
         return_state = {
             "next_node": "tool_executor",
             "tool_to_call": tool_name,
             "tool_input": tool_input,
             "current_tool_call_id": tool_call_id,
-            "messages": [ai_message],  # ВОЗВРАЩАЕМ сообщение AI здесь
+            "messages": [ai_message],
         }
-        print(f"Router node: Возвращаемое состояние: {return_state}")
+        logger.info(f"Router node: Возвращаемое состояние: {return_state}")
         return return_state
 
     except Exception as e:
-        print(f"Ошибка в LLM-роутере: {e}. Переходим к генерации.")
-        # Возвращаем ошибку в сообщении?
+        logger.error(f"Ошибка в LLM-роутере: {e}", exc_info=True)
         error_message = AIMessage(content=f"Ошибка роутера: {e}")
-        # state['messages'] += [error_message] # Добавлять ли ошибку?
         return {
             "next_node": "generate_response",
             "messages": state["messages"] + [error_message],
@@ -145,53 +131,51 @@ def router_node(state: AgentState, llm):
 
 
 # Исполнитель инструментов (добавляем возврат имени инструмента И current_tool_call_id)
-def tool_executor_node(state: AgentState):
+def tool_executor_node(state: AgentState) -> Dict[str, Any]:
     """Вызывает выбранный роутером инструмент и передает current_tool_call_id дальше."""
-    print("--- Вход в Tool Executor ---")
-    tool_name = state.get("tool_to_call")
-    tool_input = state.get("tool_input")
-    current_tool_call_id = state.get("current_tool_call_id")
-    print(
-        f"Вызов инструмента: {tool_name} с вводом: {tool_input}, ID вызова: {current_tool_call_id}"
-    )
-
-    if not tool_name:
-        print("Ошибка: Не указано имя инструмента для вызова.")
-        # Возвращаем ошибку, имя (None) и ID (None)
-        return {
-            "tool_result": "Ошибка: Не указан инструмент.",
-            "tool_name_executed": None,
-            "current_tool_call_id": current_tool_call_id,
-        }
-
-    tool_to_execute = tool_registry.get(tool_name)
-    if not tool_to_execute:
-        print(f"Ошибка: Инструмент '{tool_name}' не найден в реестре.")
-        return {
-            "tool_result": f"Ошибка: Инструмент '{tool_name}' не найден.",
-            "tool_name_executed": tool_name,
-            "current_tool_call_id": current_tool_call_id,
-        }
-
-    if not tool_input:
-        print(
-            f"Предупреждение: Нет входных данных для инструмента '{tool_name}'. Пробуем без них."
-        )
-        tool_input = {}
-
+    logger.info("--- Вход в Tool Executor ---")
     try:
+        tool_name = state.get("tool_to_call")
+        tool_input = state.get("tool_input")
+        current_tool_call_id = state.get("current_tool_call_id")
+        logger.info(
+            f"Вызов инструмента: {tool_name} с вводом: {tool_input}, ID вызова: {current_tool_call_id}"
+        )
+
+        if not tool_name:
+            logger.error("Ошибка: Не указано имя инструмента для вызова.")
+            return {
+                "tool_result": "Ошибка: Не указан инструмент.",
+                "tool_name_executed": None,
+                "current_tool_call_id": current_tool_call_id,
+            }
+
+        tool_to_execute = tool_registry.get(tool_name)
+        if not tool_to_execute:
+            logger.error(f"Ошибка: Инструмент '{tool_name}' не найден в реестре.")
+            return {
+                "tool_result": f"Ошибка: Инструмент '{tool_name}' не найден.",
+                "tool_name_executed": tool_name,
+                "current_tool_call_id": current_tool_call_id,
+            }
+
+        if not tool_input:
+            logger.warning(
+                f"Предупреждение: Нет входных данных для инструмента '{tool_name}'. Пробуем без них."
+            )
+            tool_input = {}
+
         result = tool_to_execute.invoke(tool_input)
-        print(f"Результат инструмента '{tool_name}': {result}")
-        # Возвращаем результат, имя выполненного инструмента И ID вызова
+        logger.info(f"Результат инструмента '{tool_name}': {result}")
         return {
             "tool_result": result,
             "tool_name_executed": tool_name,
             "current_tool_call_id": current_tool_call_id,
         }
     except Exception as e:
-        print(f"Ошибка при выполнении инструмента '{tool_name}': {e}")
+        logger.error(f"Ошибка при выполнении инструмента: {e}", exc_info=True)
         return {
-            "tool_result": f"Ошибка при выполнении инструмента '{tool_name}': {e}",
+            "tool_result": f"Ошибка при выполнении инструмента: {e}",
             "tool_name_executed": tool_name,
             "current_tool_call_id": current_tool_call_id,
         }
@@ -200,11 +184,11 @@ def tool_executor_node(state: AgentState):
 # Проверка вывода инструмента (ИЗМЕНЕНО: передает нужные поля дальше)
 def tool_output_guardrails_node(state: AgentState):
     """(Заглушка) Проверяет вывод инструмента и передает ключевые поля дальше."""
-    print("--- Вход в Tool Output Guardrails ---")
+    logger.info("--- Вход в Tool Output Guardrails ---")
     tool_result = state.get("tool_result")
     tool_name_executed = state.get("tool_name_executed")
     current_tool_call_id = state.get("current_tool_call_id")
-    print(
+    logger.info(
         f"Результат инструмента '{tool_name_executed}' (ID: {current_tool_call_id}) для проверки: {tool_result}"
     )
     # TODO: Реализовать логику проверки вывода
@@ -222,14 +206,14 @@ def handle_tool_result_node(state: AgentState):
     """Преобразует результат инструмента в ToolMessage и добавляет к истории,
     используя правильный tool_call_id из последнего AIMessage.
     """
-    print("--- Вход в Handle Tool Result --- ")
-    print(f"Handle Tool Result: Входящее состояние: {state}")
+    logger.info("--- Вход в Handle Tool Result --- ")
+    logger.info(f"Handle Tool Result: Входящее состояние: {state}")
     tool_result = state.get("tool_result")
     tool_name_executed = state.get("tool_name_executed")
     # tool_to_call = state.get("tool_to_call") # Имя инструмента, который *запросили* (уже не так важно здесь)
 
     if not tool_name_executed:
-        print(
+        logger.warning(
             "Не удалось определить имя выполненного инструмента для обработки результата."
         )
         # Просто возвращаем текущие сообщения, чтобы не прерывать поток
@@ -246,12 +230,12 @@ def handle_tool_result_node(state: AgentState):
                 extracted_tool_call_id = msg.tool_calls[0]["id"]
             break  # Нашли последнее нужное сообщение, выходим
 
-    print(f"Handle Tool Result: Извлеченный tool_call_id: {extracted_tool_call_id}")
+    logger.info(f"Handle Tool Result: Извлеченный tool_call_id: {extracted_tool_call_id}")
 
     # --- Создаем ToolMessage ---
     if not extracted_tool_call_id:
         # Если не нашли ID (очень странно), используем старый fallback
-        print(
+        logger.warning(
             f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось извлечь tool_call_id из AIMessage для инструмента {tool_name_executed}! Использую fallback."
         )
         tool_message = ToolMessage(
@@ -266,7 +250,7 @@ def handle_tool_result_node(state: AgentState):
             name=tool_name_executed,
             tool_call_id=extracted_tool_call_id,
         )
-        print(f"Создано ToolMessage: {tool_message}")
+        logger.info(f"Создано ToolMessage: {tool_message}")
 
     # Добавляем ToolMessage к истории сообщений
     return {"messages": state["messages"] + [tool_message]}
@@ -275,9 +259,9 @@ def handle_tool_result_node(state: AgentState):
 # ОБНОВЛЕННЫЙ ГЕНЕРАТОР ОТВЕТА: теперь основной источник контекста - история сообщений
 def response_generator_node(state: AgentState, llm):
     """Генерирует финальный ответ, основываясь на всей истории сообщений."""
-    print("--- Вход в Response Generator ---")
+    logger.info("--- Вход в Response Generator ---")
     messages_for_llm = state["messages"]
-    print(f"Сообщения для генерации: {messages_for_llm}")
+    logger.info(f"Сообщения для генерации: {messages_for_llm}")
 
     # Контекст теперь полностью в messages_for_llm (включая ToolMessage)
     # Можно удалить старую логику добавления faq_result/tool_result как AIMessage
@@ -302,20 +286,20 @@ def response_generator_node(state: AgentState, llm):
     elif messages_for_llm[0].content != system_prompt:  # Обновляем, если изменился
         messages_for_llm[0] = SystemMessage(content=system_prompt)
 
-    print(f"Отправка в LLM: {messages_for_llm}")
+    logger.info(f"Отправка в LLM: {messages_for_llm}")
     try:
         response_message = llm.invoke(messages_for_llm)
-        print(f"Получено от LLM: {response_message}")
+        logger.info(f"Получено от LLM: {response_message}")
 
         if not isinstance(response_message, AIMessage):
             # Преобразуем, если LLM вернула строку или что-то иное
             response_message = AIMessage(content=str(response_message))
 
-        print(f"Ответ LLM: {response_message.content}")
+        logger.info(f"Ответ LLM: {response_message.content}")
         # Возвращаем ТОЛЬКО новое сообщение AI, оно добавится к state['messages'] оператором '+' или operator.add
         return {"messages": [response_message]}
     except Exception as e:
-        print(f"Ошибка при вызове LLM: {e}")
+        logger.error(f"Ошибка при вызове LLM: {e}")
         error_message = AIMessage(
             content=f"Извините, произошла ошибка при генерации ответа: {e}"
         )
@@ -327,7 +311,7 @@ def output_guardrails_node(state: AgentState):
     """(Заглушка) Проверяет финальный ответ.
     В будущем здесь будет логика Output Guardrails.
     """
-    print("--- Вход в Output Guardrails ---")
+    logger.info("--- Вход в Output Guardrails ---")
     # TODO: Реализовать логику проверки вывода
     # print(f"Финальный ответ: {state['messages'][-1].content}")
     return {}
@@ -336,99 +320,76 @@ def output_guardrails_node(state: AgentState):
 # --- Построение графа (ОБНОВЛЕНО) ---
 
 
-def build_graph(llm):
-    """Строит граф LangGraph с умным роутером."""
-    workflow = StateGraph(AgentState)
-
-    # Привязываем LLM к узлам где она нужна
-    bound_router_node = functools.partial(router_node, llm=llm)
-    bound_response_generator_node = functools.partial(response_generator_node, llm=llm)
-
-    # Добавляем узлы (включая новый handle_tool_result)
-    workflow.add_node("input_guardrails", input_guardrails_node)
-    # workflow.add_node("search_faq", search_faq_node) # Узел search_faq теперь вызывается через роутер как инструмент
-    workflow.add_node("router", bound_router_node)
-    workflow.add_node("tool_executor", tool_executor_node)
-    workflow.add_node("tool_output_guardrails", tool_output_guardrails_node)
-    workflow.add_node("handle_tool_result", handle_tool_result_node)  # Новый узел
-    workflow.add_node("generate_response", bound_response_generator_node)
-    workflow.add_node("output_guardrails", output_guardrails_node)
-
-    # Точка входа
-    workflow.set_entry_point("input_guardrails")
-
-    # Ребра
-    workflow.add_edge("input_guardrails", "router")  # После входа идем в роутер
-
-    # Условный переход от роутера
-    workflow.add_conditional_edges(
-        "router",
-        lambda state: state.get("next_node"),  # Роутер сам определяет следующий узел
-        {
-            "tool_executor": "tool_executor",  # Если роутер выбрал инструмент
-            "generate_response": "generate_response",  # Если роутер решил генерировать ответ
-        },
-    )
-
-    # Путь выполнения инструмента
-    workflow.add_edge("tool_executor", "tool_output_guardrails")
-    workflow.add_edge(
-        "tool_output_guardrails", "handle_tool_result"
-    )  # Обрабатываем результат
-    workflow.add_edge(
-        "handle_tool_result", "generate_response"
-    )  # Генерируем ответ ПОСЛЕ обработки результата
-
-    # Финальные шаги
-    workflow.add_edge("generate_response", "output_guardrails")
-    workflow.add_edge("output_guardrails", END)
-
-    # Компилируем граф
-    app = workflow.compile()
-    print("Граф успешно скомпилирован с новой логикой (умный роутер).")
-    return app
+def build_graph(llm: ChatOpenAI) -> CompiledGraph:
+    """Создает и компилирует граф LangGraph для QA-бота."""
+    try:
+        # Инициализация графа
+        workflow = StateGraph(AgentState)
+        
+        # Добавляем узлы
+        workflow.add_node("input_guardrails", input_guardrails_node)
+        workflow.add_node("analyze_context", analyze_context)
+        workflow.add_node("router", router_node)
+        workflow.add_node("tool_executor", tool_executor_node)
+        workflow.add_node("tool_output_guardrails", tool_output_guardrails_node)
+        workflow.add_node("handle_tool_result", handle_tool_result_node)
+        workflow.add_node("response_generator", response_generator_node)
+        workflow.add_node("output_guardrails", output_guardrails_node)
+        
+        # Добавляем ребра
+        workflow.add_conditional_edges(
+            "analyze_context",
+            should_respond,
+            {
+                "agent": "router",
+                "end": END
+            }
+        )
+        
+        workflow.add_edge("input_guardrails", "analyze_context")
+        workflow.add_edge("router", "tool_executor")
+        workflow.add_edge("tool_executor", "tool_output_guardrails")
+        workflow.add_edge("tool_output_guardrails", "handle_tool_result")
+        workflow.add_edge("handle_tool_result", "response_generator")
+        workflow.add_edge("response_generator", "output_guardrails")
+        workflow.add_edge("output_guardrails", END)
+        
+        # Устанавливаем начальный узел
+        workflow.set_entry_point("input_guardrails")
+        
+        return workflow.compile()
+        
+    except Exception as e:
+        logger.error(f"Ошибка при создании графа: {e}", exc_info=True)
+        raise
 
 
 # --- Инициализация агента (setup_agent) ---
 
 
-def setup_agent():
-    """Инициализирует LLM и вызывает build_graph для получения скомпилированного агента."""
-    print("--- Настройка агента (через прокси) ---")
+def create_agent_workflow(tools: list[BaseTool]):
+    """Создает рабочий процесс агента с инструментами."""
+    # TODO: Реализовать создание рабочего процесса
+    pass
 
-    # Загрузка учетных данных для OpenAI-совместимого прокси из .env
-    # Эти переменные используются ChatOpenAI
-    proxy_api_key = os.getenv("API_KEY")
-    proxy_api_base = os.getenv("API_BASE")
-
-    if not proxy_api_key:
-        logger.error("API_KEY для прокси не найден в переменных окружения!")
-        # Можно упасть или использовать заглушку
-        raise ValueError("API_KEY для прокси не установлен")
-
-    if not proxy_api_base:
-        logger.error("API_BASE для прокси не найден в переменных окружения!")
-        raise ValueError("API_BASE для прокси не установлен")
-
-    # Инициализация модели через ChatOpenAI, но с указанием proxy_api_base
-    llm = ChatOpenAI(
-        openai_api_key=proxy_api_key,
-        openai_api_base=proxy_api_base,
-        model_name="yandex/yandexgpt/rc",
-        temperature=0.1,
-        max_tokens=2000,
-        request_timeout=60
-    )
-    print(f"Используется модель LLM: {llm.__class__.__name__} через прокси {proxy_api_base}")
-
-    # --- Получение скомпилированного графа --- 
-    # build_graph уже возвращает скомпилированный app
-    compiled_app = build_graph(llm) 
-
-    # Убираем повторную компиляцию:
-    # app = graph.compile() 
-    print("--- Агент собран и скомпилирован ---")
-    return compiled_app # Возвращаем результат build_graph
+def setup_agent() -> Optional[dict]:
+    """Настраивает агента с необходимыми инструментами."""
+    try:
+        # Инициализация инструментов
+        tools = [
+            AddFAQTool(),
+            SearchFAQTool(),
+            UpdateFAQTool(),
+            DeleteFAQTool()
+        ]
+        
+        # Создание графа
+        workflow = create_agent_workflow(tools)
+        
+        return workflow
+    except Exception as e:
+        logger.error(f"Ошибка при настройке агента: {e}")
+        return None
 
 
 # --- Основная функция вызова агента ---
@@ -485,3 +446,61 @@ if __name__ == "__main__":
         print("--- Тестовый вызов завершен ---")
     else:
         print("Пропуск тестового вызова: API_KEY или API_BASE для прокси не установлены.")
+
+def execute_tools(state: AgentState) -> Dict[str, Any]:
+    """Выполняет инструменты, выбранные агентом."""
+    try:
+        tool_calls = state.get("tool_calls", [])
+        results = []
+        
+        for tool_call in tool_calls:
+            tool_name = tool_call.get("name")
+            tool_args = tool_call.get("args", {})
+            
+            if tool_name in tool_registry:
+                tool = tool_registry[tool_name]
+                result = tool.invoke(tool_args)
+                results.append(result)
+            else:
+                logger.warning(f"Инструмент {tool_name} не найден")
+                
+        return {"tool_results": results}
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении инструментов: {e}", exc_info=True)
+        return {"error": str(e)}
+
+def analyze_context(state: AgentState) -> Dict[str, Any]:
+    """Анализирует контекст сообщения."""
+    logger.info("--- Анализ контекста ---")
+    try:
+        context = state.get("context", {})
+        if not context:
+            return {"should_respond": True, "confidence": 1.0}
+
+        chat_type = context.get("chat_type", "private")
+        is_mentioned = context.get("is_mentioned", False)
+        is_reply_to_bot = context.get("is_reply_to_bot", False)
+        
+        # В личных сообщениях всегда отвечаем
+        if chat_type == "private":
+            return {"should_respond": True, "confidence": 1.0}
+            
+        # Если упомянут или ответ на бота - отвечаем
+        if is_mentioned or is_reply_to_bot:
+            return {"should_respond": True, "confidence": 0.9}
+            
+        return {"should_respond": False, "confidence": 0.0}
+    except Exception as e:
+        logger.error(f"Ошибка в analyze_context: {e}", exc_info=True)
+        return {"error": str(e)}
+
+def should_respond(state: AgentState) -> str:
+    """Определяет следующий узел на основе анализа контекста."""
+    try:
+        should_respond = state.get("should_respond", False)
+        if should_respond:
+            return "agent"
+        return "end"
+    except Exception as e:
+        logger.error(f"Ошибка в should_respond: {e}", exc_info=True)
+        return "end"
