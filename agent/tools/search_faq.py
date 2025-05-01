@@ -1,5 +1,5 @@
 import logging
-from typing import Type, List
+from typing import Type, List, Dict, Any
 
 from pydantic import BaseModel, Field
 from langchain_core.tools import BaseTool
@@ -7,17 +7,17 @@ from langchain_core.callbacks import CallbackManagerForToolRun
 
 # Импортируем CRUD операции и функцию получения сессии
 from database import crud, connection, models  # models нужен для аннотации типа
+from .base_search_tool import BaseSearchTool, BaseSearchInput
 
 logger = logging.getLogger(__name__)
 
 
-class SearchFAQInput(BaseModel):
+class SearchFAQInput(BaseSearchInput):
     """Схема входных данных для SearchFAQTool."""
+    pass
 
-    query: str = Field(description="Текст вопроса для поиска в базе знаний FAQ.")
 
-
-class SearchFAQTool(BaseTool):
+class SearchFAQTool(BaseSearchTool):
     """Инструмент для поиска релевантных записей в базе знаний FAQ."""
 
     name: str = "search_faq"
@@ -30,29 +30,44 @@ class SearchFAQTool(BaseTool):
     args_schema: Type[BaseModel] = SearchFAQInput
 
     def _run(
-        self, query: str, run_manager: CallbackManagerForToolRun | None = None
+        self,
+        query: str,
+        limit: int = 5,
+        min_similarity: float = 0.7,
+        run_manager: CallbackManagerForToolRun | None = None
     ) -> str:
         """Ищет записи в FAQ и возвращает найденные результаты."""
         logger.info(f"Запуск SearchFAQTool с запросом: {query}")
-        results_str = "В базе знаний FAQ не найдено релевантных записей."
+
+        # Проверяем кэш
+        cached_results = self._get_cached_results(query, limit, min_similarity)
+        if cached_results:
+            return self._format_results(cached_results)
 
         try:
             with connection.get_db_session() as db:
                 if not db:
                     return "Ошибка: Не удалось получить сессию базы данных."
 
-                # Используем функцию поиска из crud.py
-                # TODO: Заменить на векторный поиск позже
+                # Используем оптимизированный поиск
                 search_results: List[models.FAQEntry] = crud.search_faq_entries(
-                    db, query, limit=3  # Ограничим пока 3 результатами
+                    db, query, limit=limit
                 )
 
-                if search_results:
-                    results_str = "Найдены следующие записи в FAQ:\n\n"
-                    for entry in search_results:
-                        results_str += f"Q: {entry.question}\nA: {entry.answer}\n\n"
+                # Преобразуем результаты в формат для кэширования
+                formatted_results = [
+                    {
+                        'title': entry.question,
+                        'content': entry.answer,
+                        'similarity': entry.similarity if hasattr(entry, 'similarity') else None
+                    }
+                    for entry in search_results
+                ]
 
-            return results_str.strip()
+                # Кэшируем результаты
+                self._cache_results(query, limit, min_similarity, formatted_results)
+
+                return self._format_results(formatted_results)
 
         except Exception as e:
             logger.error(

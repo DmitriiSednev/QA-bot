@@ -17,16 +17,26 @@ from langchain_core.messages import (
 # Возвращаем ChatOpenAI, так как используется OpenAI-совместимый прокси
 from langchain_openai import ChatOpenAI
 # from langchain_yandex import ChatYandexGPT # Убираем YandexGPT
-from langgraph.graph import END, StateGraph, CompiledGraph
+from langgraph.graph import END, StateGraph
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.tools import BaseTool # Убедимся, что BaseTool импортирован
 from langchain.agents import create_openai_functions_agent
 from langchain.agents.output_parsers import OpenAIFunctionsAgentOutputParser
+from langgraph.graph import Graph
+from langgraph.prebuilt import ToolNode
 
 from .state import AgentState
 
 # --- Импорт инструментов ---
-from .tools import WebSearchTool, SearchFAQTool, AddFAQTool, UpdateFAQTool, DeleteFAQTool, ContextAnalyzerTool, YandexDocsSearchTool
+from .tools import (
+    SearchFAQTool,
+    AddFAQTool,
+    UpdateFAQTool,
+    DeleteFAQTool,
+    ContextAnalyzerTool,
+    YandexCloudSearchTool,
+    ChatHistorySearchTool
+)
 
 # TODO: Импортировать другие инструменты (update_faq, delete_faq и т.д.)
 
@@ -38,8 +48,20 @@ tool_descriptions: Dict[str, str] = {
     "update_faq": "Изменить существующую запись в FAQ по её ID.",
     "delete_faq": "Удалить запись из FAQ по её ID.",
     "yandex_cloud_docs_search": "Искать информацию ИСКЛЮЧИТЕЛЬНО в официальной документации Yandex Cloud (yandex.cloud/ru/docs/). Использовать ТОЛЬКО для вопросов о Yandex Cloud, и ТОЛЬКО ЕСЛИ поиск по FAQ ('search_faq') не дал ответа (ВТОРОЙ ИСТОЧНИК).",
-    "yandex_docs_search": "Искать информацию в документации Yandex Cloud, включая технические детали API, параметры и описания. Может обрабатывать специальные форматы документации.",
+    "search_chat_history": "Искать похожие вопросы и ответы в истории чата. Использовать, когда нужно найти ранее заданные похожие вопросы.",
+    "context_analyzer": "Анализировать контекст разговора и извлекать ключевые темы и вопросы."
 }
+
+# Создаем экземпляры инструментов
+tools = [
+    SearchFAQTool(),
+    AddFAQTool(),
+    UpdateFAQTool(),
+    DeleteFAQTool(),
+    YandexCloudSearchTool(),
+    ChatHistorySearchTool(),
+    ContextAnalyzerTool()
+]
 
 # Реестр реальных объектов инструментов
 # Используем классы напрямую для создания экземпляров
@@ -48,9 +70,9 @@ tool_classes: List[Type[BaseTool]] = [
     AddFAQTool,
     UpdateFAQTool,
     DeleteFAQTool,
-    WebSearchTool,
+    YandexCloudSearchTool,
+    ChatHistorySearchTool,
     ContextAnalyzerTool,
-    YandexDocsSearchTool,
 ]
 
 # Создаем экземпляры инструментов (можно передавать параметры конфигурации сюда, если нужно)
@@ -66,6 +88,18 @@ for name in tool_registry:
 
 # COMMAND_TOOLS = {"add_faq", "update_faq", "delete_faq"}
 
+# Реализация ToolExecutor
+class ToolExecutor:
+    """Класс для выполнения инструментов."""
+    
+    def __init__(self, tools: List[BaseTool]):
+        self.tools = {tool.name: tool for tool in tools}
+    
+    def execute(self, tool_name: str, tool_input: Dict[str, Any]) -> Any:
+        """Выполняет инструмент с заданными параметрами."""
+        if tool_name not in self.tools:
+            raise ValueError(f"Инструмент {tool_name} не найден")
+        return self.tools[tool_name].invoke(tool_input)
 
 def input_guardrails_node(state: AgentState) -> Dict[str, Any]:
     """Проверяет входные данные."""
@@ -138,7 +172,7 @@ def tool_executor_node(state: AgentState) -> Dict[str, Any]:
     logger.info("--- Вход в Tool Executor ---")
     try:
         tool_name = state.get("tool_to_call")
-        tool_input = state.get("tool_input")
+        tool_input = state.get("tool_input", {})
         current_tool_call_id = state.get("current_tool_call_id")
         logger.info(
             f"Вызов инструмента: {tool_name} с вводом: {tool_input}, ID вызова: {current_tool_call_id}"
@@ -161,14 +195,10 @@ def tool_executor_node(state: AgentState) -> Dict[str, Any]:
                 "current_tool_call_id": current_tool_call_id,
             }
 
-        if not tool_input:
-            logger.warning(
-                f"Предупреждение: Нет входных данных для инструмента '{tool_name}'. Пробуем без них."
-            )
-            tool_input = {}
-
+        # Прямой вызов инструмента с распаковкой аргументов
         result = tool_to_execute.invoke(tool_input)
         logger.info(f"Результат инструмента '{tool_name}': {result}")
+        
         return {
             "tool_result": result,
             "tool_name_executed": tool_name,
@@ -178,7 +208,7 @@ def tool_executor_node(state: AgentState) -> Dict[str, Any]:
         logger.error(f"Ошибка при выполнении инструмента: {e}", exc_info=True)
         return {
             "tool_result": f"Ошибка при выполнении инструмента: {e}",
-            "tool_name_executed": tool_name,
+            "tool_name_executed": tool_name if 'tool_name' in locals() else None,
             "current_tool_call_id": current_tool_call_id,
         }
 
@@ -322,7 +352,7 @@ def output_guardrails_node(state: AgentState):
 # --- Построение графа (ОБНОВЛЕНО) ---
 
 
-def build_graph(llm: ChatOpenAI) -> CompiledGraph:
+def build_graph(llm: ChatOpenAI) -> StateGraph:
     """Создает и компилирует граф LangGraph для QA-бота."""
     try:
         # Инициализация графа
@@ -379,10 +409,13 @@ def setup_agent() -> Optional[dict]:
     try:
         # Инициализация инструментов
         tools = [
-            AddFAQTool(),
             SearchFAQTool(),
+            AddFAQTool(),
             UpdateFAQTool(),
-            DeleteFAQTool()
+            DeleteFAQTool(),
+            YandexCloudSearchTool(),
+            ChatHistorySearchTool(),
+            ContextAnalyzerTool()
         ]
         
         # Создание графа

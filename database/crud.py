@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import os  # Для переменных окружения
 from datetime import datetime, timedelta
 import numpy as np
@@ -8,7 +8,7 @@ from functools import lru_cache
 from sqlalchemy.orm import Session
 from sqlalchemy import select, update as sql_update, delete as sql_delete, text
 from sqlalchemy.exc import SQLAlchemyError
-from langchain_openai import OpenAIEmbeddings  # Импортируем эмбеддер
+from langchain_openai import OpenAIEmbeddings
 from pgvector.sqlalchemy import Vector  # Уже импортирован, но для ясности
 
 from . import models
@@ -44,20 +44,8 @@ except Exception as e:
 
 
 def _get_embedding(text: str) -> Optional[List[float]]:
-    """Вспомогательная функция для получения эмбеддинга текста."""
-    if not embeddings_model:
-        logger.error(
-            "Модель эмбеддингов не инициализирована, не могу получить эмбеддинг."
-        )
-        return None
-    try:
-        return embeddings_model.embed_query(text)
-    except Exception as e:
-        logger.error(
-            f"Ошибка при получении эмбеддинга для текста: {text[:100]}...: {e}",
-            exc_info=True,
-        )
-        return None
+    """Получает эмбеддинг для текста."""
+    return get_embeddings(text)
 
 
 def add_faq_entry(db: Session, question: str, answer: str) -> Optional[models.FAQEntry]:
@@ -353,3 +341,291 @@ def cleanup_old_faq_entries(db: Session, days: int = 30) -> int:
     embedding_cache.clear()
     
     return deleted
+
+class ChatHistoryCache:
+    def __init__(self, max_size: int = 1000, ttl: int = 3600):
+        self._cache: Dict[str, Dict] = {}
+        self._max_size = max_size
+        self._ttl = ttl
+
+    def get(self, key: str) -> Optional[Dict]:
+        if key in self._cache:
+            entry = self._cache[key]
+            if datetime.now() - entry['timestamp'] < timedelta(seconds=self._ttl):
+                return entry['data']
+            del self._cache[key]
+        return None
+
+    def set(self, key: str, data: Dict):
+        if len(self._cache) >= self._max_size:
+            oldest_key = min(self._cache.keys(), key=lambda k: self._cache[k]['timestamp'])
+            del self._cache[oldest_key]
+        self._cache[key] = {
+            'data': data,
+            'timestamp': datetime.now()
+        }
+
+    def clear(self):
+        self._cache.clear()
+
+chat_history_cache = ChatHistoryCache()
+
+def add_chat_history(
+    db: Session,
+    chat_id: int,
+    user_id: int,
+    message_text: str,
+    response_text: str | None = None
+) -> Optional[models.ChatHistory]:
+    """Добавляет новую запись в историю чата."""
+    try:
+        embedding = _get_embedding(message_text)
+        db_entry = models.ChatHistory(
+            chat_id=chat_id,
+            user_id=user_id,
+            message_text=message_text,
+            response_text=response_text,
+            embedding=embedding
+        )
+        db.add(db_entry)
+        db.commit()
+        db.refresh(db_entry)
+        return db_entry
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении записи в историю чата: {e}", exc_info=True)
+        db.rollback()
+        return None
+
+def search_chat_history(
+    db: Session,
+    query: str,
+    limit: int = 5,
+    min_similarity: float = 0.7
+) -> List[models.ChatHistory]:
+    """Ищет похожие вопросы в истории чата."""
+    try:
+        query_embedding = _get_embedding(query)
+        if query_embedding is None:
+            return []
+
+        stmt = (
+            select(models.ChatHistory)
+            .where(models.ChatHistory.embedding.cosine_distance(query_embedding) <= 1 - min_similarity)
+            .order_by(models.ChatHistory.embedding.cosine_distance(query_embedding))
+            .limit(limit)
+        )
+        results = db.execute(stmt).scalars().all()
+        return results
+    except Exception as e:
+        logger.error(f"Ошибка при поиске в истории чата: {e}", exc_info=True)
+        return []
+
+def update_chat_history_response(
+    db: Session,
+    entry_id: int,
+    response_text: str,
+    is_answered: bool = True
+) -> Optional[models.ChatHistory]:
+    """Обновляет ответ в истории чата."""
+    try:
+        entry = db.get(models.ChatHistory, entry_id)
+        if entry:
+            entry.response_text = response_text
+            entry.is_answered = is_answered
+            db.commit()
+            db.refresh(entry)
+            return entry
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении ответа в истории чата: {e}", exc_info=True)
+        db.rollback()
+        return None
+
+def add_chat_history_batch(
+    db: Session,
+    entries: List[Dict[str, Any]]
+) -> List[Optional[models.ChatHistory]]:
+    """Пакетное добавление записей в историю чата."""
+    try:
+        # Получаем эмбеддинги для всех сообщений сразу
+        messages = [entry['message_text'] for entry in entries]
+        embeddings = get_embeddings(messages)
+
+        db_entries = []
+        for entry, embedding in zip(entries, embeddings):
+            db_entry = models.ChatHistory(
+                chat_id=entry['chat_id'],
+                user_id=entry['user_id'],
+                message_text=entry['message_text'],
+                response_text=entry.get('response_text'),
+                embedding=embedding,
+                is_answered=entry.get('is_answered', False)
+            )
+            db_entries.append(db_entry)
+
+        db.add_all(db_entries)
+        db.commit()
+        for entry in db_entries:
+            db.refresh(entry)
+
+        return db_entries
+    except Exception as e:
+        logger.error(f"Ошибка при пакетном добавлении записей в историю чата: {e}", exc_info=True)
+        db.rollback()
+        return []
+
+def get_chat_history(
+    db: Session,
+    chat_id: int,
+    limit: int = 10,
+    offset: int = 0
+) -> List[models.ChatHistory]:
+    """Получение истории чата с кэшированием."""
+    cache_key = f"chat_{chat_id}_{limit}_{offset}"
+    cached_result = chat_history_cache.get(cache_key)
+    if cached_result is not None:
+        return cached_result
+
+    try:
+        result = (
+            db.query(models.ChatHistory)
+            .filter(models.ChatHistory.chat_id == chat_id)
+            .order_by(models.ChatHistory.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        chat_history_cache.set(cache_key, result)
+        return result
+    except Exception as e:
+        logger.error(f"Ошибка при получении истории чата {chat_id}: {e}", exc_info=True)
+        return []
+
+def search_chat_history_optimized(
+    db: Session,
+    query: str,
+    chat_id: Optional[int] = None,
+    limit: int = 5,
+    min_similarity: float = 0.7,
+    time_window: Optional[int] = None  # в днях
+) -> List[models.ChatHistory]:
+    """Оптимизированный поиск по истории чата."""
+    try:
+        # Проверяем кэш для эмбеддинга запроса
+        query_embedding = embedding_cache.get(query)
+        if query_embedding is None:
+            query_embedding = _get_embedding(query)
+            if query_embedding is not None:
+                embedding_cache.set(query, query_embedding)
+
+        if query_embedding is None:
+            return []
+
+        # Строим базовый запрос
+        stmt = select(models.ChatHistory).where(
+            models.ChatHistory.embedding.cosine_distance(query_embedding) <= 1 - min_similarity
+        )
+
+        # Добавляем фильтры
+        if chat_id is not None:
+            stmt = stmt.where(models.ChatHistory.chat_id == chat_id)
+
+        if time_window is not None:
+            cutoff_date = datetime.now() - timedelta(days=time_window)
+            stmt = stmt.where(models.ChatHistory.created_at >= cutoff_date)
+
+        # Сортировка и лимит
+        stmt = (
+            stmt.order_by(models.ChatHistory.embedding.cosine_distance(query_embedding))
+            .limit(limit)
+        )
+
+        results = db.execute(stmt).scalars().all()
+        return results
+    except Exception as e:
+        logger.error(f"Ошибка при оптимизированном поиске в истории чата: {e}", exc_info=True)
+        return []
+
+def cleanup_chat_history(
+    db: Session,
+    days: int = 30,
+    batch_size: int = 1000
+) -> int:
+    """Пакетная очистка старой истории чата."""
+    try:
+        cutoff_date = datetime.now() - timedelta(days=days)
+        total_deleted = 0
+        
+        while True:
+            # Получаем batch ID для удаления
+            ids_to_delete = (
+                db.query(models.ChatHistory.id)
+                .filter(models.ChatHistory.created_at < cutoff_date)
+                .limit(batch_size)
+                .all()
+            )
+            
+            if not ids_to_delete:
+                break
+                
+            # Преобразуем список кортежей в список ID
+            ids = [id_[0] for id_ in ids_to_delete]
+            
+            # Удаляем записи пакетом
+            deleted = db.query(models.ChatHistory).filter(
+                models.ChatHistory.id.in_(ids)
+            ).delete(synchronize_session=False)
+            
+            db.commit()
+            total_deleted += deleted
+            
+            # Очищаем кэш после каждого пакета
+            chat_history_cache.clear()
+            
+        return total_deleted
+    except Exception as e:
+        logger.error(f"Ошибка при очистке истории чата: {e}", exc_info=True)
+        db.rollback()
+        return 0
+
+def analyze_chat_history(
+    db: Session,
+    chat_id: int,
+    time_window: Optional[int] = None  # в днях
+) -> Dict[str, Any]:
+    """Анализ истории чата."""
+    try:
+        query = db.query(models.ChatHistory).filter(models.ChatHistory.chat_id == chat_id)
+        
+        if time_window is not None:
+            cutoff_date = datetime.now() - timedelta(days=time_window)
+            query = query.filter(models.ChatHistory.created_at >= cutoff_date)
+        
+        # Получаем статистику
+        total_messages = query.count()
+        answered_messages = query.filter(models.ChatHistory.is_answered == True).count()
+        avg_response_time = db.query(
+            func.avg(
+                func.extract('epoch', models.ChatHistory.updated_at - models.ChatHistory.created_at)
+            )
+        ).filter(
+            models.ChatHistory.is_answered == True
+        ).scalar() or 0
+        
+        return {
+            'total_messages': total_messages,
+            'answered_messages': answered_messages,
+            'unanswered_messages': total_messages - answered_messages,
+            'response_rate': (answered_messages / total_messages * 100) if total_messages > 0 else 0,
+            'avg_response_time_seconds': float(avg_response_time),
+        }
+    except Exception as e:
+        logger.error(f"Ошибка при анализе истории чата {chat_id}: {e}", exc_info=True)
+        return {
+            'error': str(e),
+            'total_messages': 0,
+            'answered_messages': 0,
+            'unanswered_messages': 0,
+            'response_rate': 0,
+            'avg_response_time_seconds': 0,
+        }

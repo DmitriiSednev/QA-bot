@@ -2,10 +2,11 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import easyocr
 import signal
+import fcntl
 from typing import Optional, Dict, Any, List, Union
 
 from dotenv import load_dotenv
@@ -24,10 +25,14 @@ from agent.agent_executor import setup_agent
 from langgraph.graph.message import AnyMessage
 from langchain_core.messages import HumanMessage, AIMessage
 from database import connection, crud
+from langgraph.graph import END, StateGraph
+from langchain.agents.agent import AgentExecutor
+from agent.tools.chat_history_loader import ChatHistoryLoaderTool
 
 # --- Конфигурация логирования --- #
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "bot.log")
+LOCK_FILE = "/tmp/telegram_bot.lock"
 
 # Создаем директорию логов, если ее нет
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -42,6 +47,48 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+def acquire_lock():
+    """Попытка получить блокировку для предотвращения множественных запусков."""
+    try:
+        # Проверяем, существует ли файл блокировки
+        if os.path.exists(LOCK_FILE):
+            # Проверяем, активен ли процесс
+            with open(LOCK_FILE, 'r') as f:
+                try:
+                    old_pid = int(f.read().strip())
+                    if os.path.exists(f"/proc/{old_pid}"):
+                        logger.error(f"Бот уже запущен (PID: {old_pid})")
+                        sys.exit(1)
+                    else:
+                        # Процесс не существует, удаляем старый файл блокировки
+                        os.unlink(LOCK_FILE)
+                except (ValueError, FileNotFoundError):
+                    # Некорректный PID или процесс уже завершен
+                    os.unlink(LOCK_FILE)
+        
+        # Создаем новый файл блокировки
+        with open(LOCK_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+        
+        # Получаем файловый дескриптор для fcntl
+        lock_fd = open(LOCK_FILE, 'r')
+        fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_fd
+    except IOError:
+        logger.error("Не удалось получить блокировку. Возможно, бот уже запущен.")
+        sys.exit(1)
+
+def release_lock(lock_fd):
+    """Освобождение блокировки."""
+    try:
+        if lock_fd:
+            fcntl.lockf(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+        if os.path.exists(LOCK_FILE):
+            os.unlink(LOCK_FILE)
+    except Exception as e:
+        logger.error(f"Ошибка при освобождении блокировки: {e}")
 
 # --- Загрузка переменных окружения --- #
 load_dotenv()
@@ -173,21 +220,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка при обработке фото от user {user_id} в чате {chat_id}: {e}", exc_info=True)
         await message.reply_text("Произошла ошибка при обработке изображения.")
 
-async def cleanup_scheduler():
+async def cleanup_scheduler(context: ContextTypes.DEFAULT_TYPE):
     """Планировщик для очистки старых FAQ записей."""
-    while True:
-        logger.info("Запуск планового удаления старых FAQ записей...")
-        try:
-            with connection.get_db_session() as db:
-                if db:
-                    deleted = crud.cleanup_old_faq_entries(db)
-                    logger.info(f"Удалено {deleted} старых FAQ записей")
-                else:
-                    logger.error("Не удалось получить сессию БД для очистки")
-        except Exception as e:
-            logger.error(f"Ошибка при выполнении очистки: {e}", exc_info=True)
-        
-        await asyncio.sleep(24 * 60 * 60)  # 24 часа в секундах
+    logger.info("Запуск планового удаления старых FAQ записей...")
+    try:
+        with connection.get_db_session() as db:
+            if db:
+                deleted = crud.cleanup_old_faq_entries(db)
+                logger.info(f"Удалено {deleted} старых FAQ записей")
+            else:
+                logger.error("Не удалось получить сессию БД для очистки")
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении очистки: {e}", exc_info=True)
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /admin для управления админами."""
@@ -280,42 +324,68 @@ async def update_docs_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Ошибка при обновлении документации: {e}", exc_info=True)
         await message.reply_text(f"Произошла ошибка при обновлении документации: {e}")
 
-def handle_shutdown(signum, frame):
-    logger.info("Получен сигнал завершения, начинаем graceful shutdown...")
+async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик добавления бота в группу."""
+    chat_id = update.message.chat_id
+    new_members = update.message.new_chat_members
+    
+    # Проверяем, добавлен ли наш бот
+    bot_added = any(member.id == context.bot.id for member in new_members)
+    
+    if bot_added:
+        logger.info(f"Бот добавлен в чат {chat_id}")
+        try:
+            # Загружаем историю чата
+            loader = ChatHistoryLoaderTool()
+            result = loader._run(chat_id=chat_id, days_to_load=30)
+            logger.info(f"Результат загрузки истории: {result}")
+            
+            # Приветственное сообщение
+            welcome_message = (
+                "Привет! Я бот для поиска информации. "
+                "Я уже загрузил историю чата и готов помочь с поиском. "
+                "Чтобы задать вопрос, просто напишите его или упомяните меня через @."
+            )
+            await context.bot.send_message(chat_id=chat_id, text=welcome_message)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при обработке добавления бота в чат {chat_id}: {e}", exc_info=True)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Произошла ошибка при инициализации бота. Пожалуйста, попробуйте позже."
+            )
+
+def handle_shutdown(signum, frame, lock_fd=None):
+    """Обработчик сигналов завершения."""
+    logger.info("Получен сигнал завершения, освобождаем ресурсы...")
+    if lock_fd:
+        release_lock(lock_fd)
     sys.exit(0)
 
-signal.signal(signal.SIGINT, handle_shutdown)
-signal.signal(signal.SIGTERM, handle_shutdown)
-
-# --- Точка входа --- #
 def main():
-    logger.info("Запуск Telegram-бота...")
-    logger.info(f"Имя пользователя бота для упоминаний: @{BOT_USERNAME}")
-    if ADMIN_IDS:
-        logger.info(f"Администраторы бота: {ADMIN_IDS}")
-    else:
-        logger.warning("Список администраторов пуст (ADMIN_USER_IDS не задан или некорректен в .env)")
-
-    defaults = Defaults()
-    application = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .defaults(defaults)
-        .build()
-    )
-
-    # Добавляем обработчики
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(CommandHandler("admin", admin_command))
-    application.add_handler(CommandHandler("update_docs", update_docs_command))
-
-    # Добавляем планировщик очистки в асинхронный цикл событий
-    application.job_queue.run_custom(callback=cleanup_scheduler, job_kwargs={"name": "faq_cleanup"})
-
-    logger.info("Бот запущен и готов принимать сообщения.")
-    application.run_polling()
+    """Основная функция запуска бота."""
+    lock_fd = acquire_lock()
+    
+    try:
+        # Инициализация приложения
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        
+        # Добавление обработчиков
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        application.add_handler(CommandHandler("admin", admin_command))
+        application.add_handler(CommandHandler("update_docs", update_docs_command))
+        application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_chat_members))
+        
+        # Запуск бота в режиме polling
+        logger.info("Бот запущен в режиме polling")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+    except Exception as e:
+        logger.critical(f"Критическая ошибка при запуске бота: {e}", exc_info=True)
+    finally:
+        release_lock(lock_fd)
 
 if __name__ == "__main__":
     main()

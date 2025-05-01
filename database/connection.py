@@ -1,89 +1,102 @@
 import os
 import logging
 from contextlib import contextmanager
-from typing import Optional, Generator, Any, Union, ContextManager
-
-from sqlalchemy import create_engine
+from typing import Optional, Generator
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, OperationalError
+from dotenv import load_dotenv
+from . import models
 
+# Настройка логирования
 logger = logging.getLogger(__name__)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# Загрузка переменных окружения
+load_dotenv()
 
-if not DATABASE_URL:
-    logger.warning(
-        "DATABASE_URL не установлена. Работа с базой данных будет невозможна."
-        " Убедитесь, что переменная задана в .env файле."
-    )
-    # Установка Engine в None, чтобы можно было проверить перед использованием
-    engine = None
-    SessionLocal = None
-else:
+# Получение параметров подключения из переменных окружения
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "qa_bot")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASS = os.getenv("DB_PASSWORD", "")
+
+# Формирование URL подключения
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+# Создание движка SQLAlchemy
+engine = create_engine(DATABASE_URL)
+
+# Создание фабрики сессий
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def init_db():
+    """Инициализация базы данных и создание таблиц."""
     try:
-        # echo=True полезно для отладки SQL запросов
-        engine = create_engine(DATABASE_URL, echo=False)
-        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        logger.info("Подключение к базе данных успешно настроено.")
-    except SQLAlchemyError as e:
-        logger.error(f"Ошибка при создании подключения к БД: {e}", exc_info=True)
-        engine = None
-        SessionLocal = None
-    except Exception as e:  # Ловим другие возможные ошибки парсинга URL и т.д.
-        logger.error(f"Неожиданная ошибка при настройке БД: {e}", exc_info=True)
-        engine = None
-        SessionLocal = None
-
+        # Создаем все таблицы
+        models.Base.metadata.create_all(bind=engine)
+        
+        # Проверяем существование колонки created_at
+        with engine.connect() as connection:
+            for table in ['faq_entries', 'chat_history', 'admins']:
+                try:
+                    connection.execute(text(f"SELECT created_at FROM {table} LIMIT 1"))
+                except OperationalError:
+                    # Если колонки нет, добавляем её
+                    connection.execute(text(f"""
+                        ALTER TABLE {table} 
+                        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    """))
+                    connection.commit()
+        
+        logger.info("База данных успешно инициализирована")
+    except Exception as e:
+        logger.error(f"Ошибка при инициализации базы данных: {e}")
+        raise
 
 @contextmanager
-def get_db_session() -> Generator[Optional[Session], None, None]:
-    """Предоставляет сессию SQLAlchemy для работы с БД.
-
-    Используется как менеджер контекста:
-        with get_db_session() as db:
-            # работа с db (сессией)
-            if db:
-                ...
-            else:
-                # Обработка случая, когда сессия не создана
-                ...
-
-    Гарантирует закрытие сессии после использования.
-    Возвращает None, если SessionLocal не был инициализирован.
-    """
-    if not SessionLocal:
-        logger.error("Попытка получить сессию БД, но SessionLocal не инициализирован.")
-        yield None
-        return
-
+def get_db_session() -> Generator[Session, None, None]:
+    """Контекстный менеджер для получения сессии базы данных."""
     db = SessionLocal()
     try:
         yield db
-    except SQLAlchemyError as e:
-        logger.error(f"Ошибка SQLAlchemy в сессии: {e}", exc_info=True)
-        db.rollback()  # Откатываем транзакцию при ошибке
-        raise  # Перевыбрасываем ошибку для обработки выше
-    except Exception as e:
-        logger.error(f"Неожиданная ошибка в сессии БД: {e}", exc_info=True)
-        db.rollback()
-        raise
     finally:
         db.close()
 
+class DatabaseConnection:
+    """Класс для управления подключением к базе данных."""
+    
+    def __init__(self):
+        self.engine = engine
+        self.SessionLocal = SessionLocal
+        logger.info("Подключение к базе данных успешно настроено")
+    
+    @contextmanager
+    def get_db_session(self) -> Generator[Session, None, None]:
+        """Получение сессии базы данных."""
+        db = self.SessionLocal()
+        try:
+            yield db
+        except SQLAlchemyError as e:
+            logger.error(f"Ошибка SQLAlchemy в сессии: {e}", exc_info=True)
+            db.rollback()
+            raise
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка в сессии БД: {e}", exc_info=True)
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
-# Дополнительная функция для проверки доступности БД (опционально)
-def check_db_connection() -> bool:
-    """Проверяет, можно ли установить соединение с БД."""
-    if not engine:
-        logger.warning("Проверка соединения: Engine не инициализирован.")
-        return False
-    try:
-        with engine.connect() as connection:
-            logger.info("Проверка соединения с БД: Успешно.")
-            return True
-    except SQLAlchemyError as e:
-        logger.error(f"Проверка соединения с БД: Ошибка - {e}", exc_info=True)
-        return False
-    except Exception as e:
-        logger.error(f"Проверка соединения с БД: Неожиданная ошибка - {e}", exc_info=True)
-        return False
+    def check_connection(self) -> bool:
+        """Проверка соединения с базой данных."""
+        try:
+            with self.engine.connect():
+                logger.info("Проверка соединения с БД: Успешно")
+                return True
+        except Exception as e:
+            logger.error(f"Проверка соединения с БД: Ошибка - {e}", exc_info=True)
+            return False
+
+# Создаем глобальный экземпляр подключения
+db_connection = DatabaseConnection()

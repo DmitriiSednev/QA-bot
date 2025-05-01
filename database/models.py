@@ -40,6 +40,25 @@ class Admin(Base):
         return f"<Admin(id={self.id}, user_id={self.user_id}, username='{self.username}')>"
 
 
+class ChatHistory(Base):
+    """Модель для хранения истории чата с векторными эмбеддингами."""
+    __tablename__ = "chat_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    chat_id = Column(Integer, nullable=False, index=True)  # ID чата Telegram
+    user_id = Column(Integer, nullable=False, index=True)  # ID пользователя
+    message_text = Column(Text, nullable=False)
+    response_text = Column(Text, nullable=True)  # Ответ бота
+    embedding = Column(Vector(1536), nullable=True)  # Векторное представление сообщения
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+    is_answered = Column(Boolean, default=False)  # Был ли дан ответ на вопрос
+    answer_quality = Column(Integer, nullable=True)  # Оценка качества ответа
+
+    def __repr__(self):
+        return f"<ChatHistory(id={self.id}, chat_id={self.chat_id})>"
+
+
 # Если engine и SessionLocal определены здесь, оставляем их
 # Например:
 # DATABASE_URL = "postgresql://user:password@host:port/db"
