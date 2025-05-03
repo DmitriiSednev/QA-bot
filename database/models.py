@@ -1,5 +1,6 @@
 from sqlalchemy import Column, Integer, String, Text, DateTime, func, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.sql.sqltypes import DateTime
 from pgvector.sqlalchemy import Vector
 
 # Создаем базовый класс для декларативных моделей
@@ -15,7 +16,7 @@ class FAQEntry(Base):
     question = Column(Text, nullable=False, index=True)  # Индекс по вопросу для поиска
     answer = Column(Text, nullable=False)
     embedding = Column(Vector(1536), nullable=True)
-    created_at = Column(DateTime, default=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     # Дополнительные поля, которые можно добавить позже:
     # updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -33,7 +34,7 @@ class Admin(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, unique=True, nullable=False, index=True)  # Telegram user_id
     username = Column(String(255), nullable=True)  # Telegram username
-    created_at = Column(DateTime, default=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
 
     def __repr__(self):
@@ -50,8 +51,8 @@ class ChatHistory(Base):
     message_text = Column(Text, nullable=False)
     response_text = Column(Text, nullable=True)  # Ответ бота
     embedding = Column(Vector(1536), nullable=True)  # Векторное представление сообщения
-    created_at = Column(DateTime, default=func.now(), nullable=False)
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     is_answered = Column(Boolean, default=False)  # Был ли дан ответ на вопрос
     answer_quality = Column(Integer, nullable=True)  # Оценка качества ответа
 

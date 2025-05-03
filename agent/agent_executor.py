@@ -34,7 +34,6 @@ from .tools import (
     UpdateFAQTool,
     DeleteFAQTool,
     ContextAnalyzerTool,
-    YandexCloudSearchTool,
     ChatHistorySearchTool
 )
 
@@ -47,7 +46,6 @@ tool_descriptions: Dict[str, str] = {
     "add_faq": "Добавить новую пару вопрос-ответ в базу знаний FAQ.",
     "update_faq": "Изменить существующую запись в FAQ по её ID.",
     "delete_faq": "Удалить запись из FAQ по её ID.",
-    "yandex_cloud_docs_search": "Искать информацию ИСКЛЮЧИТЕЛЬНО в официальной документации Yandex Cloud (yandex.cloud/ru/docs/). Использовать ТОЛЬКО для вопросов о Yandex Cloud, и ТОЛЬКО ЕСЛИ поиск по FAQ ('search_faq') не дал ответа (ВТОРОЙ ИСТОЧНИК).",
     "search_chat_history": "Искать похожие вопросы и ответы в истории чата. Использовать, когда нужно найти ранее заданные похожие вопросы.",
     "context_analyzer": "Анализировать контекст разговора и извлекать ключевые темы и вопросы."
 }
@@ -58,7 +56,6 @@ tools = [
     AddFAQTool(),
     UpdateFAQTool(),
     DeleteFAQTool(),
-    YandexCloudSearchTool(),
     ChatHistorySearchTool(),
     ContextAnalyzerTool()
 ]
@@ -70,7 +67,6 @@ tool_classes: List[Type[BaseTool]] = [
     AddFAQTool,
     UpdateFAQTool,
     DeleteFAQTool,
-    YandexCloudSearchTool,
     ChatHistorySearchTool,
     ContextAnalyzerTool,
 ]
@@ -413,7 +409,6 @@ def setup_agent() -> Optional[dict]:
             AddFAQTool(),
             UpdateFAQTool(),
             DeleteFAQTool(),
-            YandexCloudSearchTool(),
             ChatHistorySearchTool(),
             ContextAnalyzerTool()
         ]

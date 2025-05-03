@@ -21,13 +21,12 @@ from telegram.ext import (
 )
 
 # --- Import Agent Logic ---
-from agent.agent_executor import setup_agent
+from agent.agent_executor import setup_agent, analyze_context
 from langgraph.graph.message import AnyMessage
 from langchain_core.messages import HumanMessage, AIMessage
 from database import connection, crud
 from langgraph.graph import END, StateGraph
 from langchain.agents.agent import AgentExecutor
-from agent.tools.chat_history_loader import ChatHistoryLoaderTool
 
 # --- Конфигурация логирования --- #
 LOG_DIR = "logs"
@@ -140,6 +139,13 @@ async def run_agent_for_user(user_id: int, chat_id: int, text: str, context: Con
         if final_messages and isinstance(final_messages[-1], AIMessage):
             final_response = final_messages[-1].content
             logger.info(f"Агент завершил работу для thread_id: {thread_id}.")
+            # --- Добавляем в FAQ, если вопрос про Яндекс Клауд и ответа ещё нет ---
+            if "яндекс" in text.lower():
+                with connection.get_db_session() as db:
+                    # Проверяем, есть ли похожий вопрос
+                    similar = crud.search_faq_entries(db, text, limit=1)
+                    if not similar:
+                        crud.add_faq_entry(db, question=text, answer=final_response)
         else:
              logger.warning(f"Агент завершился, но не найдено финального AIMessage для thread_id: {thread_id}")
     except Exception as e:
@@ -161,7 +167,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message_text:
         return
 
-    # Проверка, нужно ли боту отвечать
+    # Реакция на "спасибо"
+    if message_text.strip().lower() in ["спасибо", "спасибо!", "благодарю"]:
+        await message.reply_text("Пожалуйста! Если будут ещё вопросы — обращайтесь.")
+        return
+
+    # Реакция на "это не то"
+    if "это не то" in message_text.lower() or "не совсем то" in message_text.lower():
+        await message.reply_text("Извините, что не попал в точку. Можете уточнить, что именно вы хотели узнать?")
+        return
+
     should_respond = False
     if message.chat.type == "private":
         should_respond = True
@@ -178,6 +193,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif is_reply_to_bot:
             should_respond = True
             logger.info(f"Сообщение является ответом на сообщение бота в чате {chat_id}.")
+        else:
+            # Новый блок: если не упомянут и не reply, проверяем контекст
+            # Импортируй функцию analyze_context из agent_executor
+            from agent.agent_executor import analyze_context
+            context_info = {
+                "chat_type": message.chat.type,
+                "is_mentioned": False,
+                "is_reply_to_bot": False,
+                "message_time": message.date,
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "username": message.from_user.username,
+                "message_text": message_text,
+                "previous_messages": []  # Можно добавить историю, если нужно
+            }
+            state = {"context": context_info}
+            result = analyze_context(state)
+            if result.get("should_respond") and "яндекс" in message_text.lower():
+                should_respond = True
 
     if not should_respond:
         return
@@ -296,34 +330,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка в команде admin: {e}", exc_info=True)
         await message.reply_text("Произошла ошибка при выполнении команды")
 
-async def update_docs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /update_docs для обновления документации."""
-    message = update.message
-    user_id = message.from_user.id
-
-    # Проверяем, является ли пользователь админом
-    if str(user_id) not in ADMIN_USER_IDS_STR.split(","):
-        await message.reply_text("У вас нет прав для использования этой команды.")
-        return
-
-    try:
-        await message.reply_text("Начинаю обновление документации Yandex Cloud...")
-        
-        with connection.get_db_session() as db:
-            if not db:
-                await message.reply_text("Ошибка подключения к БД")
-                return
-                
-            from database.yandex_docs import YandexDocsManager
-            docs_manager = YandexDocsManager()
-            await docs_manager.update_docs(db)
-            
-        await message.reply_text("Документация успешно обновлена!")
-        
-    except Exception as e:
-        logger.error(f"Ошибка при обновлении документации: {e}", exc_info=True)
-        await message.reply_text(f"Произошла ошибка при обновлении документации: {e}")
-
 async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик добавления бота в группу."""
     chat_id = update.message.chat_id
@@ -335,11 +341,6 @@ async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_
     if bot_added:
         logger.info(f"Бот добавлен в чат {chat_id}")
         try:
-            # Загружаем историю чата
-            loader = ChatHistoryLoaderTool()
-            result = loader._run(chat_id=chat_id, days_to_load=30)
-            logger.info(f"Результат загрузки истории: {result}")
-            
             # Приветственное сообщение
             welcome_message = (
                 "Привет! Я бот для поиска информации. "
@@ -375,7 +376,6 @@ def main():
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         application.add_handler(CommandHandler("admin", admin_command))
-        application.add_handler(CommandHandler("update_docs", update_docs_command))
         application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_chat_members))
         
         # Запуск бота в режиме polling

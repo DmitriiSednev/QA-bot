@@ -23,21 +23,6 @@ class UpdateFAQInput(BaseModel):
         description="The new text for the answer. Provide only if you want to change it.",
     )
 
-    @validator("question", "answer")
-    def check_at_least_one_field(cls, v, values):
-        """Проверяет, что хотя бы одно поле (вопрос или ответ) предоставлено для обновления."""
-        # Этот валидатор вызывается для каждого поля, но нам нужна общая проверка
-        # Мы можем проверить это в самом _run, так как validator сложнее для такой логики
-        return v
-
-    # Можно добавить валидатор, который будет вызван после всех полей:
-    @validator("*", pre=True, always=True)  # Не совсем так работает
-    def check_fields_after_creation(cls, v, values):
-        # Лучше проверку на наличие хотя бы одного поля делать в _run
-        # if 'entry_id' in values and not values.get('question') and not values.get('answer'):
-        #     raise ValueError("Хотя бы question или answer должны быть указаны для обновления.")
-        return v
-
 
 class UpdateFAQTool(BaseTool):
     """Инструмент для обновления существующей записи в базе знаний FAQ."""
@@ -59,8 +44,8 @@ class UpdateFAQTool(BaseTool):
             f"Running UpdateFAQTool for ID={entry_id} with Q:'{question is not None}' A:'{answer is not None}'"
         )
 
-        if question is None and answer is None:
-            return "Error: You must provide either a new question or a new answer to update."
+        if not question and not answer:
+            return "Ошибка: Нужно указать хотя бы новый вопрос или новый ответ для обновления."
 
         try:
             with connection.get_db_session() as db:

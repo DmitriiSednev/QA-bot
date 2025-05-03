@@ -6,7 +6,6 @@ from .delete_faq import DeleteFAQTool
 from .search_faq import SearchFAQTool
 from .update_faq import UpdateFAQTool
 from .context_analyzer import ContextAnalyzerTool
-from .yandex_cloud_search import YandexCloudSearchTool
 from .chat_history_search import ChatHistorySearchTool
 
 __all__ = [
@@ -17,6 +16,5 @@ __all__ = [
     "SearchFAQTool",
     "UpdateFAQTool",
     "ContextAnalyzerTool",
-    "YandexCloudSearchTool",
     "ChatHistorySearchTool"
 ]
