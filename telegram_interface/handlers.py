@@ -6,7 +6,13 @@ from typing import Dict, Any, List, Union
 
 import easyocr
 from telegram import Update, BotCommand
-from telegram.ext import ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 from telegram.constants import ParseMode
 
 from database import connection, models

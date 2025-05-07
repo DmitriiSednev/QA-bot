@@ -20,37 +20,40 @@ from agent.state import AgentState
 load_dotenv()
 
 
-# Фикстура для тестовой БД
-@pytest.fixture(scope="session")
-def test_engine():
-    SQLALCHEMY_DATABASE_URL = os.getenv(
-        "TEST_DATABASE_URL", "postgresql://test:test@localhost:5432/test_db"
-    )
-    engine = create_engine(SQLALCHEMY_DATABASE_URL)
-    try:
-        # Создаем все таблицы
-        models.Base.metadata.create_all(bind=engine)
-        yield engine
-    finally:
-        # Удаляем все таблицы после тестов
-        models.Base.metadata.drop_all(bind=engine)
+# --- Строка подключения к БД для тестов ---
+# Используем SQLite в памяти для скорости и изоляции тестов
+# Это избавит от необходимости иметь запущенный PostgreSQL для тестов
+SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
+# Если нужны тесты с PostgreSQL (например, для pgvector), используй:
+# SQLALCHEMY_DATABASE_URL = os.getenv(
+#     "TEST_DATABASE_URL", "postgresql://test:test@localhost:5432/test_db"
+# )
 
 
-@pytest.fixture(scope="function")
-def test_db(test_engine) -> Generator[Session, None, None]:
-    """Фикстура для тестовой сессии БД. Откатывает транзакцию после каждого теста."""
-    connection_db = test_engine.connect()
-    transaction = connection_db.begin()
-    db_session = sessionmaker(autocommit=False, autoflush=False, bind=connection_db)
+engine = create_engine(SQLALCHEMY_DATABASE_URL)  # Движок создается один раз
+# Важно: Для SQLite in-memory каждый connect() создает новую БД.
+# Поэтому для тестов нужно использовать одно соединение для create_all и сессий.
+# Или создавать таблицы перед каждым тестом.
+
+# Фабрика сессий остается прежней
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+@pytest.fixture(scope="function")  # Используем scope="function" для SQLite in-memory
+def test_db() -> Generator[Session, None, None]:
+    """Фикстура для тестовой сессии БД SQLite в памяти."""
+    # Создаем таблицы перед каждым тестом для чистой БД
+    models.Base.metadata.create_all(bind=engine)
+    db_session = TestingSessionLocal()
     try:
         yield db_session
     finally:
         db_session.close()
-        transaction.rollback()
-        connection_db.close()
+        # Удаляем таблицы после каждого теста
+        models.Base.metadata.drop_all(bind=engine)
 
 
-# Фикстура для создания тестовых данных
+# Фикстура для создания тестовых данных FAQ
 @pytest.fixture
 def sample_faq_entries(test_db: Session) -> List[models.FAQEntry]:
     entries_data = [
