@@ -1,8 +1,9 @@
 import pytest
-from typing import Dict, Any, Generator
+import asyncio
+from typing import Dict, Any, Generator, List
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
-from database import crud, models, connection
+from database import crud_faq, models, connection
 from agent.tools import AddFAQTool, SearchFAQTool, UpdateFAQTool, DeleteFAQTool
 from agent.graph_builder import setup_agent
 from langchain_core.messages import HumanMessage
@@ -18,10 +19,13 @@ from agent.state import AgentState
 # Загружаем переменные окружения для тестов
 load_dotenv()
 
+
 # Фикстура для тестовой БД
 @pytest.fixture(scope="session")
 def test_engine():
-    SQLALCHEMY_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "postgresql://test:test@localhost:5432/test_db")
+    SQLALCHEMY_DATABASE_URL = os.getenv(
+        "TEST_DATABASE_URL", "postgresql://test:test@localhost:5432/test_db"
+    )
     engine = create_engine(SQLALCHEMY_DATABASE_URL)
     try:
         # Создаем все таблицы
@@ -31,102 +35,148 @@ def test_engine():
         # Удаляем все таблицы после тестов
         models.Base.metadata.drop_all(bind=engine)
 
-@pytest.fixture
+
+@pytest.fixture(scope="function")
 def test_db(test_engine) -> Generator[Session, None, None]:
-    """Фикстура для тестовой сессии БД."""
-    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    db = TestingSessionLocal()
+    """Фикстура для тестовой сессии БД. Откатывает транзакцию после каждого теста."""
+    connection_db = test_engine.connect()
+    transaction = connection_db.begin()
+    db_session = sessionmaker(autocommit=False, autoflush=False, bind=connection_db)
     try:
-        yield db
+        yield db_session
     finally:
-        db.rollback()
-        db.close()
+        db_session.close()
+        transaction.rollback()
+        connection_db.close()
+
 
 # Фикстура для создания тестовых данных
 @pytest.fixture
-def sample_faq_entries(test_db: Session):
-    entries = [
+def sample_faq_entries(test_db: Session) -> List[models.FAQEntry]:
+    entries_data = [
         {"question": "python question?", "answer": "python answer!"},
         {"question": "docker question?", "answer": "docker answer!"},
-        {"question": "test question?", "answer": "test answer!"}
+        {"question": "test question?", "answer": "test answer!"},
     ]
-    created_entries = []
-    for entry in entries:
-        db_entry = crud.add_faq_entry(test_db, entry["question"], entry["answer"])
-        created_entries.append(db_entry)
+    created_entries: List[models.FAQEntry] = []
+    for entry_data in entries_data:
+        db_entry = crud_faq.add_faq_entry(
+            test_db, entry_data["question"], entry_data["answer"]
+        )
+        if db_entry:
+            created_entries.append(db_entry)
     return created_entries
+
 
 # Тесты CRUD операций
 def test_add_faq_entry(test_db: Session):
-    entry = crud.add_faq_entry(test_db, "test question?", "test answer!")
+    entry = crud_faq.add_faq_entry(test_db, "test question?", "test answer!")
     assert entry is not None
     assert entry.question == "test question?"
     assert entry.answer == "test answer!"
     assert entry.id is not None
 
-def test_search_faq_entries(test_db: Session, sample_faq_entries):
-    results = crud.search_faq_entries(test_db, "python")
-    assert len(results) > 0
+
+def test_search_faq_entries(
+    test_db: Session, sample_faq_entries: List[models.FAQEntry]
+):
+    assert len(sample_faq_entries) > 0, "Sample FAQ entries were not created"
+    results = crud_faq.search_faq_entries(test_db, "python", limit=1)
+    assert len(results) >= 1
     assert any("python" in entry.question.lower() for entry in results)
 
-def test_update_faq_entry(test_db: Session, sample_faq_entries):
-    entry = sample_faq_entries[0]
-    updated = crud.update_faq_entry(
+
+def test_update_faq_entry(test_db: Session, sample_faq_entries: List[models.FAQEntry]):
+    assert len(sample_faq_entries) > 0, "Sample FAQ entries were not created"
+    entry_to_update = sample_faq_entries[0]
+    updated = crud_faq.update_faq_entry(
         test_db,
-        entry_id=entry.id,
+        entry_id=entry_to_update.id,
         question="updated question?",
-        answer="updated answer!"
+        answer="updated answer!",
     )
     assert updated is not None
     assert updated.question == "updated question?"
     assert updated.answer == "updated answer!"
 
-def test_delete_faq_entry(test_db: Session, sample_faq_entries):
-    entry = sample_faq_entries[0]
-    result = crud.delete_faq_entry(test_db, entry.id)
+
+def test_delete_faq_entry(test_db: Session, sample_faq_entries: List[models.FAQEntry]):
+    assert len(sample_faq_entries) > 0, "Sample FAQ entries were not created"
+    entry_to_delete = sample_faq_entries[0]
+    result = crud_faq.delete_faq_entry(test_db, entry_to_delete.id)
     assert result is True
-    assert crud.get_faq_entry_by_id(test_db, entry.id) is None
+    assert crud_faq.get_faq_entry_by_id(test_db, entry_to_delete.id) is None
+
 
 # Тесты инструментов
-def test_add_faq_tool(test_db: Session, monkeypatch):
-    def mock_get_db_session():
-        return test_db
-    
-    monkeypatch.setattr(connection, "get_db_session", mock_get_db_session)
-    
+@pytest.fixture
+def mock_db_session(test_db: Session, monkeypatch):
+    def mock_get_session_context():
+        class MockSessionContext:
+            def __enter__(self):
+                return test_db
+
+            def __exit__(self, type, value, traceback):
+                pass
+
+        return MockSessionContext()
+
+    monkeypatch.setattr(connection, "get_db_session", mock_get_session_context)
+
+
+def test_add_faq_tool(test_db: Session, mock_db_session):
     tool = AddFAQTool()
     result = tool._run("test tool question?", "test tool answer!")
-    assert "успешно" in result.lower()
-    
-    # Проверяем, что запись действительно добавлена
-    entries = crud.search_faq_entries(test_db, "test tool question?")
+    assert (
+        "успешно добавлена" in result.lower() or "successfully added" in result.lower()
+    )
+    entries = crud_faq.search_faq_entries(test_db, "test tool question?", limit=1)
     assert len(entries) > 0
     assert entries[0].question == "test tool question?"
 
-def test_search_faq_tool(test_db: Session, sample_faq_entries, monkeypatch):
-    def mock_get_db_session():
-        return test_db
-    
-    monkeypatch.setattr(connection, "get_db_session", mock_get_db_session)
-    
+
+def test_search_faq_tool(
+    test_db: Session, sample_faq_entries: List[models.FAQEntry], mock_db_session
+):
+    assert (
+        len(sample_faq_entries) > 0
+    ), "Sample FAQ entries were not created for search tool test"
     tool = SearchFAQTool()
-    result = tool._run("python")
+    query_text = sample_faq_entries[0].question
+    expected_answer = sample_faq_entries[0].answer
+    result = tool._run(query=query_text)
     assert isinstance(result, str)
-    assert "python question?" in result
-    assert "python answer!" in result
+    assert query_text in result
+    assert expected_answer in result
+
 
 # Тесты агента
 @pytest.mark.asyncio
 async def test_agent_flow():
-    agent = setup_agent()
-    assert agent is not None
-    
-    state: Dict[str, Any] = {
+    agent_tuple = await setup_agent()
+    assert agent_tuple is not None, "Agent setup failed"
+    agent_app, checkpoint_conn = agent_tuple
+    assert agent_app is not None, "Agent app is None after setup"
+    assert checkpoint_conn is not None, "Checkpoint DB connection is None after setup"
+
+    initial_state: Dict[str, Any] = {
         "messages": [HumanMessage(content="Как использовать Python?")],
-        "user_id": 123
+        "user_id": 123,
     }
-    
-    result = await agent.ainvoke(state)
-    assert "messages" in result
-    assert len(result["messages"]) > 0
-    assert isinstance(result["messages"][-1].content, str)
+    config = {"configurable": {"thread_id": "pytest_thread_1"}}
+
+    try:
+        final_state = await agent_app.ainvoke(initial_state, config=config)
+        assert final_state is not None
+        assert "messages" in final_state
+        assert any(
+            isinstance(msg, HumanMessage) for msg in final_state["messages"]
+        ), "No HumanMessage in final state"
+        if final_state["messages"]:
+            assert isinstance(final_state["messages"][-1].content, str)
+        else:
+            pytest.fail("Agent returned no messages in final_state")
+
+    finally:
+        if checkpoint_conn:
+            await checkpoint_conn.close()

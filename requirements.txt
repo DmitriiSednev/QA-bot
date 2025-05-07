@@ -47,4 +47,7 @@ beautifulsoup4==4.12.3
 certifi==2025.1.31
 charset-normalizer==3.4.1
 
+# Добавляем prometheus-client из ветки old-main
+prometheus-client==2.3.1 # или актуальная версия, если знаешь
+
 

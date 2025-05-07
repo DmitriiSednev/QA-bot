@@ -5,10 +5,12 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import select, update as sql_update, delete as sql_delete, func
 from sqlalchemy.exc import SQLAlchemyError
-from pgvector.sqlalchemy import Vector
+# from pgvector.sqlalchemy import Vector # Закомментировано, если pgvector не используется или вызывает проблемы
 
 from . import models
-from .embeddings import get_embeddings
+# Заменяем get_embeddings на get_embedding если функция ожидает один текст
+# или обрабатываем список внутри функций
+from .embeddings import get_embeddings # Предполагаем, что get_embeddings может принять список текстов
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +26,9 @@ def add_chat_history(
 ) -> Optional[models.ChatHistory]:
     """Добавляет запись в историю чата с эмбеддингом."""
     try:
-        embeddings_list = get_embeddings([message_text])
-        embedding = embeddings_list[0] if embeddings_list else None
+        # get_embeddings ожидает список строк и возвращает список списков float или None
+        embeddings_result = get_embeddings([message_text])
+        embedding = embeddings_result[0] if embeddings_result and embeddings_result[0] else None
 
         if embedding is None:
             logger.warning(f"Не удалось получить эмбеддинг для сообщения истории чата: '{message_text[:100]}...'. Запись будет добавлена БЕЗ эмбеддинга.")
@@ -35,7 +38,7 @@ def add_chat_history(
             user_id=user_id,
             message_text=message_text,
             response_text=response_text,
-            embedding=embedding,
+            embedding=embedding, # embedding может быть None
             is_answered=is_answered or (response_text is not None)
         )
         db.add(db_entry)
@@ -62,7 +65,7 @@ def search_chat_history(
     """Ищет записи в истории чата по векторному сходству."""
     try:
         query_embeddings_list = get_embeddings([query])
-        query_embedding = query_embeddings_list[0] if query_embeddings_list else None
+        query_embedding = query_embeddings_list[0] if query_embeddings_list and query_embeddings_list[0] else None
 
         if query_embedding is None:
             logger.error(f"Не удалось получить эмбеддинг для запроса истории чата: '{query[:100]}...'")
@@ -74,6 +77,8 @@ def search_chat_history(
         stmt = select(models.ChatHistory).where(models.ChatHistory.embedding != None)
 
         # Добавляем условие векторного поиска
+        # Убедимся, что тип query_embedding совместим с .cosine_distance
+        # pgvector ожидает list[float] или numpy.ndarray
         stmt = stmt.where(models.ChatHistory.embedding.cosine_distance(query_embedding) <= max_distance)
 
         # Добавляем фильтр по chat_id, если он указан
@@ -99,8 +104,14 @@ def search_chat_history(
     except SQLAlchemyError as e:
         logger.error(f"Ошибка SQLAlchemy при поиске в истории чата: {e}", exc_info=True)
         return []
-    except Exception as e:
-        logger.error(f"Неожиданная ошибка при поиске в истории чата: {e}", exc_info=True)
+    except Exception as e: # Более общая ошибка для проблем с pgvector
+        if "operator does not exist: vector" in str(e).lower():
+            logger.error(
+                f"Ошибка векторного поиска ChatHistory: оператор не найден. Расширение pgvector включено и совместимо с типом эмбеддинга? Ошибка: {e}",
+                exc_info=True,
+            )
+        else:
+            logger.error(f"Неожиданная ошибка при поиске в истории чата: {e}", exc_info=True)
         return []
 
 def update_chat_history_response(
@@ -120,21 +131,18 @@ def update_chat_history_response(
         if answer_quality is not None:
             values_to_update["answer_quality"] = answer_quality
 
-        # Используем update и returning для получения обновленного объекта (если СУБД поддерживает)
         stmt = (
             sql_update(models.ChatHistory)
             .where(models.ChatHistory.id == entry_id)
             .values(**values_to_update)
-            .returning(models.ChatHistory) # Возвращаем обновленные поля
+            .returning(models.ChatHistory) 
         )
 
-        # Выполняем и получаем результат
         result = db.execute(stmt).scalar_one_or_none()
 
         if result:
-            db.commit() # Коммитим изменения
+            db.commit() 
             logger.info(f"Обновлен ответ для записи истории чата ID={entry_id}")
-            # result уже содержит обновленный объект
             return result
         else:
             logger.warning(f"Запись истории чата ID={entry_id} не найдена для обновления.")
@@ -153,83 +161,76 @@ def add_chat_history_batch(
     entries: List[Dict[str, Any]]
 ) -> List[Optional[models.ChatHistory]]:
     """Пакетно добавляет записи в историю чата."""
-    results: List[Optional[models.ChatHistory]] = []
+    results: List[Optional[models.ChatHistory]] = [None] * len(entries) # Инициализируем список для результатов
     if not entries:
         return results
 
-    # Получаем эмбеддинги для всех сообщений одним запросом
-    messages = [entry.get('message_text', '') for entry in entries]
-    embeddings_list = get_embeddings(messages) if messages else []
+    messages_texts = [entry.get('message_text', '') for entry in entries]
+    
+    all_embeddings_list = get_embeddings(messages_texts) if messages_texts else []
 
-    if embeddings_list is None:
+    if all_embeddings_list is None:
         logger.error("Ошибка получения эмбеддингов для пакетного добавления истории чата. Добавление без эмбеддингов.")
-        embeddings_map = {}
-    elif len(embeddings_list) != len(messages):
-        logger.error(f"Количество эмбеддингов ({len(embeddings_list)}) не совпадает с количеством сообщений ({len(messages)}) для пакетного добавления.")
-        # Создаем пустую карту или карту с None, чтобы избежать ошибок ниже
-        embeddings_map = {msg: None for msg in messages}
+        # В этом случае все эмбеддинги будут None
+        embeddings_map = {text: None for text in messages_texts}
+    elif len(all_embeddings_list) != len(messages_texts):
+        logger.error(f"Количество эмбеддингов ({len(all_embeddings_list)}) не совпадает с количеством сообщений ({len(messages_texts)}) для пакетного добавления.")
+        embeddings_map = {text: None for text in messages_texts} # Все эмбеддинги None
     else:
-        # Создаем словарь {текст_сообщения: эмбеддинг}
-        embeddings_map = dict(zip(messages, embeddings_list))
+        embeddings_map = dict(zip(messages_texts, all_embeddings_list))
 
     db_entries_to_add = []
-    original_indices = [] # Храним исходные индексы для сопоставления результатов
-    for i, entry in enumerate(entries):
-        message_text = entry.get('message_text', '')
-        # Получаем эмбеддинг из карты
-        embedding = embeddings_map.get(message_text)
+    original_indices_map = {} # Для сопоставления объектов с исходными индексами после commit
 
-        db_entry = models.ChatHistory(
-            chat_id=entry.get('chat_id'),
-            user_id=entry.get('user_id'),
+    for i, entry_data in enumerate(entries):
+        message_text = entry_data.get('message_text', '')
+        embedding = embeddings_map.get(message_text) # Может быть None
+
+        db_entry_obj = models.ChatHistory(
+            chat_id=entry_data.get('chat_id'),
+            user_id=entry_data.get('user_id'),
             message_text=message_text,
-            response_text=entry.get('response_text'),
+            response_text=entry_data.get('response_text'),
             embedding=embedding,
-            is_answered=entry.get('is_answered', (entry.get('response_text') is not None)),
-            # created_at и updated_at устанавливаются по умолчанию
+            is_answered=entry_data.get('is_answered', (entry_data.get('response_text') is not None)),
         )
-        db_entries_to_add.append(db_entry)
-        original_indices.append(i)
+        db_entries_to_add.append(db_entry_obj)
+        original_indices_map[id(db_entry_obj)] = i # Сохраняем индекс по id объекта в памяти
 
     if not db_entries_to_add:
         logger.warning("Нет записей для пакетного добавления в историю чата.")
-        return [None] * len(entries) # Возвращаем список None правильной длины
+        return results
 
     try:
-        # Добавляем все подготовленные объекты
         db.add_all(db_entries_to_add)
-        # Коммитим транзакцию
         db.commit()
 
-        # После коммита получаем ID и другие сгенерированные значения
-        # Важно: db.refresh() не работает с add_all напрямую.
-        # Нам нужно вернуть добавленные объекты. Если СУБД поддерживает RETURNING,
-        # ID могли бы быть получены сразу, но для универсальности вернем объекты из списка.
-        # Объекты в db_entries_to_add должны обновиться после commit (если сессия не закрыта).
+        # Обновляем результаты на основе добавленных объектов
+        successful_count = 0
+        for db_obj in db_entries_to_add:
+            if db_obj.id is not None: # Проверяем, что объект был успешно сохранен и получил ID
+                original_idx = original_indices_map.get(id(db_obj))
+                if original_idx is not None:
+                    results[original_idx] = db_obj
+                    successful_count +=1
+                else: # Очень маловероятно
+                    logger.error(f"Не удалось найти исходный индекс для объекта ChatHistory с ID {db_obj.id} после batch add.")
+            else: # Если объект не получил ID
+                 logger.error(f"Объект ChatHistory не получил ID после пакетного добавления. Данные: { {k:v for k,v in db_obj.__dict__.items() if not k.startswith('_')} }")
 
-        # Создаем итоговый список с None на случай ошибок
-        final_results: List[Optional[models.ChatHistory]] = [None] * len(entries)
-        for i, entry_obj in enumerate(db_entries_to_add):
-            original_index = original_indices[i]
-            # Проверяем, присвоен ли ID после коммита
-            if entry_obj.id is not None:
-                final_results[original_index] = entry_obj
-            else:
-                # Если ID не присвоен (очень странно), логируем ошибку
-                logger.error(f"Объект ChatHistory не получил ID после пакетного добавления (исходный индекс {original_index})")
 
-        successful_count = sum(1 for r in final_results if r is not None)
         logger.info(f"Пакетно добавлено {successful_count} из {len(entries)} записей в историю чата.")
-        return final_results
+        return results
 
     except SQLAlchemyError as e:
         logger.error(f"Ошибка SQLAlchemy при пакетном добавлении записей в историю чата: {e}", exc_info=True)
         db.rollback()
-        return [None] * len(entries)
+        return [None] * len(entries) # Возвращаем список None той же длины
     except Exception as e:
         logger.error(f"Неожиданная ошибка при пакетном добавлении записей в историю чата: {e}", exc_info=True)
         db.rollback()
         return [None] * len(entries)
+
 
 def get_chat_history(
     db: Session,
@@ -242,14 +243,12 @@ def get_chat_history(
         stmt = (
             select(models.ChatHistory)
             .where(models.ChatHistory.chat_id == chat_id)
-            .order_by(models.ChatHistory.created_at.desc()) # Сортируем по убыванию даты
+            .order_by(models.ChatHistory.created_at.desc()) 
             .offset(offset)
             .limit(limit)
         )
         result = db.execute(stmt).scalars().all()
-        # Возвращаем в хронологическом порядке (самые старые первыми), если нужно для контекста
-        # return result[::-1]
-        return result # Пока возвращаем как есть (самые новые первыми)
+        return result 
     except SQLAlchemyError as e:
         logger.error(f"Ошибка SQLAlchemy при получении истории чата {chat_id}: {e}", exc_info=True)
         return []
@@ -260,7 +259,7 @@ def get_chat_history(
 def cleanup_chat_history(
     db: Session,
     days: int = 30,
-    batch_size: int = 1000 # Размер пакета для удаления
+    batch_size: int = 1000 
 ) -> int:
     """Удаляет старые записи истории чата пакетами."""
     if days <= 0:
@@ -268,7 +267,7 @@ def cleanup_chat_history(
         return 0
     if batch_size <= 0:
         logger.warning("Размер пакета для очистки истории чата должен быть > 0.")
-        batch_size = 1000 # Значение по умолчанию, если указан некорректный
+        batch_size = 1000 
 
     try:
         cutoff_date = datetime.now() - timedelta(days=days)
@@ -276,7 +275,6 @@ def cleanup_chat_history(
         logger.info(f"Начало очистки истории чата старше {cutoff_date.strftime('%Y-%m-%d')} пакетами по {batch_size}...")
 
         while True:
-            # Выбираем ID записей для удаления в текущем пакете
             ids_to_delete_stmt = (
                 select(models.ChatHistory.id)
                 .where(models.ChatHistory.created_at < cutoff_date)
@@ -286,14 +284,12 @@ def cleanup_chat_history(
 
             if not ids_result:
                 logger.info("Больше нет записей истории чата для удаления.")
-                break # Выходим из цикла, если удалять больше нечего
+                break 
 
-            # Удаляем выбранные записи
             delete_stmt = sql_delete(models.ChatHistory).where(models.ChatHistory.id.in_(ids_result))
             result = db.execute(delete_stmt)
             deleted_in_batch = result.rowcount
 
-            # Коммитим транзакцию для текущего пакета
             try:
                 db.commit()
                 total_deleted += deleted_in_batch
@@ -302,10 +298,8 @@ def cleanup_chat_history(
                 logger.error(f"Ошибка SQLAlchemy при коммите удаления пакета истории чата: {commit_err}", exc_info=True)
                 db.rollback()
                 logger.warning("Откат транзакции удаления пакета. Остановка очистки.")
-                # Возвращаем количество уже удаленных записей
                 return total_deleted
 
-            # Если удалено меньше, чем размер пакета, значит, это был последний пакет
             if deleted_in_batch < batch_size:
                 break
 
@@ -314,7 +308,7 @@ def cleanup_chat_history(
     except SQLAlchemyError as e:
         logger.error(f"Ошибка SQLAlchemy при очистке истории чата: {e}", exc_info=True)
         db.rollback()
-        return -1 # Возвращаем -1 в случае ошибки
+        return -1 
     except Exception as e:
         logger.error(f"Неожиданная ошибка при очистке истории чата: {e}", exc_info=True)
         db.rollback()
@@ -327,30 +321,22 @@ def analyze_chat_history(
 ) -> Dict[str, Any]:
     """Анализирует статистику по истории конкретного чата."""
     try:
-        # Базовый запрос для выборки из нужного чата
         base_stmt = select(models.ChatHistory).where(models.ChatHistory.chat_id == chat_id)
 
-        # Добавляем фильтр по времени, если указан
         if time_window_days is not None and time_window_days > 0:
             cutoff_date = datetime.now() - timedelta(days=time_window_days)
             base_stmt = base_stmt.where(models.ChatHistory.created_at >= cutoff_date)
 
-        # Создаем CTE (Common Table Expression) или подзапрос для удобства
         subq = base_stmt.subquery()
 
-        # Считаем общее количество сообщений
         total_messages_stmt = select(func.count()).select_from(subq)
         total_messages = db.execute(total_messages_stmt).scalar() or 0
 
-        # Считаем количество отвеченных сообщений
         answered_stmt = select(func.count()).select_from(subq).where(subq.c.is_answered == True)
         answered_messages = db.execute(answered_stmt).scalar() or 0
 
-        # Считаем среднее время ответа (если есть отвеченные)
         avg_response_time = 0.0
         if answered_messages > 0:
-            # Разница между updated_at (время ответа) и created_at (время вопроса)
-            # Используем func.extract('epoch', ...) для получения разницы в секундах
             avg_response_time_stmt = select(
                 func.avg(
                     func.extract('epoch', subq.c.updated_at - subq.c.created_at)
@@ -365,14 +351,13 @@ def analyze_chat_history(
             'answered_messages': answered_messages,
             'unanswered_messages': total_messages - answered_messages,
             'response_rate': (answered_messages / total_messages * 100.0) if total_messages > 0 else 0.0,
-            'avg_response_time_seconds': float(avg_response_time), # Преобразуем в float
+            'avg_response_time_seconds': float(avg_response_time), 
         }
     except SQLAlchemyError as e:
         logger.error(f"Ошибка SQLAlchemy при анализе истории чата {chat_id}: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"Неожиданная ошибка при анализе истории чата {chat_id}: {e}", exc_info=True)
 
-    # Возвращаем словарь с ошибкой или нулями в случае проблем
     return {
         'error': "Произошла ошибка при анализе истории чата",
         'chat_id': chat_id,
@@ -382,4 +367,9 @@ def analyze_chat_history(
         'unanswered_messages': 0,
         'response_rate': 0.0,
         'avg_response_time_seconds': 0.0,
-    } 
+    }
+
+# Код из old-main (заглушки) был удален, так как мы выбрали HEAD.
+# Если здесь были какие-то уникальные комментарии или структура из old-main,
+# которые нужно было бы сохранить, их пришлось бы переносить вручную.
+# В данном случае, версия из HEAD является более полной реализацией.
