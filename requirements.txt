@@ -1,26 +1,50 @@
+# Основные зависимости LangChain и LangGraph
+langchain==0.3.24
+langchain-core==0.3.56
+langgraph==0.3.34
+
+# --- Yandex --- Добавлено/Обновлено ---
+langchain-community>=0.0.56 # Убедимся, что версия свежая для адаптеров Яндекса
+yandexcloud>=0.218.0 # Yandex Cloud SDK (может пригодиться, хотя адаптеры важнее)
+
+# LLM/Embeddings (УДАЛЯЕМ OpenAI, если переходим полностью на Yandex)
+# langchain-openai==0.3.14 # Убираем
+
+# База данных
+sqlalchemy==2.0.40
+psycopg2-binary==2.9.10
+pgvector==0.4.0
 alembic==1.15.2
+aiosqlite==0.21.0 # Добавлена зависимость для AsyncSqliteSaver
+
+# Telegram
+python-telegram-bot==22.0
+
+# Утилиты
+python-dotenv==1.0.0
+pyyaml==6.0.2
+requests==2.31.0
+portalocker==2.8.2
+
+# OCR (Опционально)
+easyocr==1.7.2
+torch==2.7.0 # Зависимость easyocr
+numpy==2.2.5 # Зависимость easyocr/torch
+pillow==11.2.1 # Зависимость easyocr
+opencv-python-headless==4.11.0.86 # Зависимость easyocr
+
+# Тестирование
+pytest==8.0.2
+pytest-asyncio==0.23.5
+
+# Кеширование
+redis==5.0.7
+
+# Прочее (если есть)
 annotated-types==0.7.0
 anyio==4.9.0
 beautifulsoup4==4.12.3
 certifi==2025.1.31
 charset-normalizer==3.4.1
-easyocr==1.7.2
-langchain==0.3.24
-langchain-core==0.3.56
-langchain-openai==0.3.14
-langgraph==0.3.34
-numpy==2.2.5
-opencv-python-headless==4.11.0.86
-pgvector==0.4.0
-pillow==11.2.1
-psycopg2-binary==2.9.10
-python-dotenv==1.0.0
-python-telegram-bot==22.0
-pyyaml==6.0.2
-requests==2.31.0
-sqlalchemy==2.0.40
-torch==2.7.0
-pytest==8.0.2
-pytest-asyncio==0.23.5
 
 

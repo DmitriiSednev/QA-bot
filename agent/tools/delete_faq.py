@@ -4,7 +4,8 @@ from typing import Type
 from pydantic import BaseModel, Field
 from langchain_core.tools import BaseTool
 
-from database import crud, connection
+from database import connection
+from database.crud_faq import delete_faq_entry
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,9 @@ class DeleteFAQTool(BaseTool):
 
         try:
             with connection.get_db_session() as db:
-                success = crud.delete_faq_entry(db, entry_id=entry_id)
+                if not db:
+                    return "Ошибка: Не удалось получить сессию базы данных."
+                success = delete_faq_entry(db, entry_id=entry_id)
                 if success:
                     logger.info(f"Successfully deleted FAQ entry ID={entry_id}.")
                     return f"Successfully deleted FAQ entry with ID {entry_id}."

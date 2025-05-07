@@ -3,7 +3,6 @@ from .models import FAQEntry
 from .connection import get_db_session
 import logging
 from typing import Optional, List
-from database.embeddings import get_embeddings  # Импортируем функцию
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +22,9 @@ def get_knowledge_base_stats():
         return None 
 
 def get_embeddings_for_text(text: str) -> Optional[List[float]]:
+    from database.embeddings import get_embeddings
     try:
-        return get_embeddings(text)
+        return get_embeddings([text])[0]
     except Exception as e:
         logger.error(f"Ошибка при получении эмбеддингов: {e}")
         return None 

@@ -5,7 +5,8 @@ from pydantic import BaseModel, Field, validator
 from langchain_core.tools import BaseTool
 from langchain_core.callbacks import CallbackManagerForToolRun
 
-from database import crud, connection, models
+from database import connection, models
+from database.crud_faq import update_faq_entry
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,9 @@ class UpdateFAQTool(BaseTool):
 
         try:
             with connection.get_db_session() as db:
-                updated_entry = crud.update_faq_entry(
+                if not db:
+                    return "Ошибка: Не удалось получить сессию базы данных."
+                updated_entry = update_faq_entry(
                     db, entry_id=entry_id, question=question, answer=answer
                 )
                 if updated_entry:
@@ -57,9 +60,9 @@ class UpdateFAQTool(BaseTool):
                     return f"Successfully updated FAQ entry with ID {entry_id}."
                 else:
                     logger.warning(
-                        f"FAQ entry with ID={entry_id} not found for update."
+                        f"FAQ entry with ID={entry_id} not found or error during update."
                     )
-                    return f"Error: FAQ entry with ID {entry_id} not found."
+                    return f"Error: FAQ entry with ID {entry_id} not found or update failed."
         except Exception as e:
             logger.error(f"Error updating FAQ entry ID={entry_id}: {e}", exc_info=True)
             return f"An error occurred while updating FAQ entry ID {entry_id}: {e}"

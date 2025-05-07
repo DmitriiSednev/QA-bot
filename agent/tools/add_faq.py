@@ -5,7 +5,8 @@ from pydantic import BaseModel, Field
 from langchain_core.tools import BaseTool
 from langchain_core.callbacks import CallbackManagerForToolRun
 
-from database import crud, connection
+from database import connection
+from database.crud_faq import add_faq_entry
 
 logger = logging.getLogger(__name__)
 
@@ -42,14 +43,14 @@ class AddFAQTool(BaseTool):
             with connection.get_db_session() as db:
                 if not db:
                     return "Ошибка: Не удалось получить сессию базы данных."
-
-                db_entry = crud.add_faq_entry(db, question=question, answer=answer)
+                
+                db_entry = add_faq_entry(db, question=question, answer=answer)
 
                 if db_entry:
                     # TODO: Обновить векторное хранилище здесь!
                     return f"Запись FAQ (ID: {db_entry.id}) успешно добавлена в базу знаний."
                 else:
-                    return "Не удалось добавить запись в FAQ."
+                    return "Не удалось добавить запись в FAQ из-за внутренней ошибки."
 
         except Exception as e:
             logger.error(

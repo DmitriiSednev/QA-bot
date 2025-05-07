@@ -4,10 +4,16 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from database import crud, models, connection
 from agent.tools import AddFAQTool, SearchFAQTool, UpdateFAQTool, DeleteFAQTool
-from agent.agent_executor import setup_agent
+from agent.graph_builder import setup_agent
 from langchain_core.messages import HumanMessage
 import os
 from dotenv import load_dotenv
+from database.models import Base, FAQEntry
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from langgraph.checkpoint.sqlite import SqliteSaver
+from agent.state import AgentState
+
 
 # Загружаем переменные окружения для тестов
 load_dotenv()

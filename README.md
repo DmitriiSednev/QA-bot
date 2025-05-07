@@ -7,7 +7,7 @@
 *   **Язык:** Python 3.11+
 *   **Telegram API:** `python-telegram-bot`
 *   **LLM Оркестрация:** Langchain & LangGraph
-*   **LLM:** Используется через API-прокси (например, OpenRouter, Merkulov) - модель настраивается в `.env` и `agent/agent_executor.py`.
+*   **LLM:** Используется через API-прокси (например, OpenRouter) - модель настраивается в `.env` и `agent/agent_executor.py`.
 *   **База Данных:** Supabase (PostgreSQL)
 *   **Векторное хранилище:** `pgvector` (расширение PostgreSQL в Supabase)
 *   **ORM:** SQLAlchemy

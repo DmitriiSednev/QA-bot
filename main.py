@@ -3,14 +3,17 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
-import io
-import easyocr
-import signal
-import fcntl
-from typing import Optional, Dict, Any, List, Union
+
+# import io # Больше не нужен здесь
+import easyocr  # Оставляем для инициализации
+
+# import signal # Убираем импорт signal
+
+# import portalocker # Удаляем, т.к. логика в core.lock
+from typing import Optional, Dict, Set  # Any, List, Union могут быть не нужны
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -18,20 +21,29 @@ from telegram.ext import (
     filters,
     ContextTypes,
     Defaults,
+    ApplicationBuilder,
+    CallbackQueryHandler,  # Добавим, если будут инлайн-кнопки
 )
+from telegram.constants import ParseMode
 
 # --- Import Agent Logic ---
-from agent.agent_executor import setup_agent, analyze_context
-from langgraph.graph.message import AnyMessage
-from langchain_core.messages import HumanMessage, AIMessage
-from database import connection, crud
-from langgraph.graph import END, StateGraph
-from langchain.agents.agent import AgentExecutor
+from agent.graph_builder import setup_agent
 
-# --- Конфигурация логирования --- #
+# --- База данных и модели (если нужны напрямую, например, для первоначальной проверки админов) ---
+from database import connection, models
+from database.crud_admin import get_admin_by_user_id, add_admin
+from database.redis_cache import RedisCache  # Импортируем класс кеша
+
+# --- Импорт обработчиков и задач ---
+from telegram_interface import handlers, jobs
+
+# --- Импорт утилит блокировки ---
+from core.lock import acquire_lock, release_lock
+
+# --- Конфигурация логирования ---
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "bot.log")
-LOCK_FILE = "/tmp/telegram_bot.lock"
+# LOCK_FILE перенесен в core.lock
 
 # Создаем директорию логов, если ее нет
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -39,353 +51,317 @@ os.makedirs(LOG_DIR, exist_ok=True)
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_FILE)
-    ]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(LOG_FILE)],
 )
+logging.getLogger("httpx").setLevel(
+    logging.WARNING
+)  # Убираем излишнее логирование HTTPX
+logging.getLogger("easyocr").setLevel(
+    logging.ERROR
+)  # Убираем детальное логирование EasyOCR
+logging.getLogger("PIL").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(
+    logging.WARNING
+)  # Уменьшаем шум от apscheduler
+
 logger = logging.getLogger(__name__)
 
-def acquire_lock():
-    """Попытка получить блокировку для предотвращения множественных запусков."""
-    try:
-        # Проверяем, существует ли файл блокировки
-        if os.path.exists(LOCK_FILE):
-            # Проверяем, активен ли процесс
-            with open(LOCK_FILE, 'r') as f:
-                try:
-                    old_pid = int(f.read().strip())
-                    if os.path.exists(f"/proc/{old_pid}"):
-                        logger.error(f"Бот уже запущен (PID: {old_pid})")
-                        sys.exit(1)
-                    else:
-                        # Процесс не существует, удаляем старый файл блокировки
-                        os.unlink(LOCK_FILE)
-                except (ValueError, FileNotFoundError):
-                    # Некорректный PID или процесс уже завершен
-                    os.unlink(LOCK_FILE)
-        
-        # Создаем новый файл блокировки
-        with open(LOCK_FILE, 'w') as f:
-            f.write(str(os.getpid()))
-        
-        # Получаем файловый дескриптор для fcntl
-        lock_fd = open(LOCK_FILE, 'r')
-        fcntl.lockf(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return lock_fd
-    except IOError:
-        logger.error("Не удалось получить блокировку. Возможно, бот уже запущен.")
-        sys.exit(1)
-
-def release_lock(lock_fd):
-    """Освобождение блокировки."""
-    try:
-        if lock_fd:
-            fcntl.lockf(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
-        if os.path.exists(LOCK_FILE):
-            os.unlink(LOCK_FILE)
-    except Exception as e:
-        logger.error(f"Ошибка при освобождении блокировки: {e}")
-
-# --- Загрузка переменных окружения --- #
+# --- Загрузка переменных окружения ---
 load_dotenv()
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "placeholder_bot_username").lstrip('@')
-# Загружаем ID админов
-ADMIN_USER_IDS_STR = os.getenv("ADMIN_USER_IDS", "")
-ADMIN_IDS = set()
+ADMIN_USER_IDS_STR = os.getenv("ADMIN_USER_IDS")
+BOT_USERNAME = os.getenv("BOT_USERNAME")  # Имя пользователя бота (без @)
+
+# --- Обработка ID администраторов ---
+ADMIN_IDS: Set[int] = set()
 if ADMIN_USER_IDS_STR:
     try:
-        ADMIN_IDS = {int(admin_id.strip()) for admin_id in ADMIN_USER_IDS_STR.split(",")}
-        logger.info(f"Загружены ID администраторов: {ADMIN_IDS}")
+        ADMIN_IDS = {
+            int(admin_id.strip())
+            for admin_id in ADMIN_USER_IDS_STR.split(",")
+            if admin_id.strip()
+        }
+        logger.info(f"Загружены ID администраторов из .env: {ADMIN_IDS}")
     except ValueError:
-        logger.error("Ошибка парсинга ADMIN_USER_IDS в .env. Убедитесь, что это числа через запятую.")
+        logger.error(
+            "Ошибка парсинга ADMIN_USER_IDS в .env. Убедитесь, что это числа через запятую."
+        )
+        ADMIN_IDS = set()
 
+# --- Проверка критических переменных ---
 if not TELEGRAM_BOT_TOKEN:
     logger.critical("TELEGRAM_BOT_TOKEN не найден! Бот не может запуститься.")
     sys.exit(1)
+if not BOT_USERNAME:
+    logger.warning(
+        "BOT_USERNAME не найден в .env. Некоторые функции (ответы в группах) могут работать некорректно."
+    )
 
-# --- Инициализация OCR --- #
-OCR_READER = None
-try:
-    OCR_READER = easyocr.Reader(['ru', 'en'], gpu=False)
-    logger.info("OCR Reader (easyocr) инициализирован для языков [ru, en].")
-except Exception as e:
-    logger.error(f"Ошибка инициализации OCR Reader: {e}", exc_info=True)
 
-# --- Инициализация Агента LangGraph --- #
-try:
-    agent_app = setup_agent()
-except Exception as e:
-    logger.critical(f"Ошибка при инициализации агента: {e}", exc_info=True)
-    sys.exit(1)
-
-# --- Вспомогательная функция для вызова агента ---
-async def run_agent_for_user(user_id: int, chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info(f"Вызов агента для user {user_id} в чате {chat_id}, текст: '{text}'")
-    thread_id = f"telegram_{chat_id}" 
-    config: Dict[str, Any] = {"configurable": {"thread_id": thread_id}}
-    inputs: Dict[str, Union[List[HumanMessage], int]] = {
-        "messages": [HumanMessage(content=text)], 
-        "user_id": user_id
-    }
-    final_response: str = "Извините, я не смог обработать ваш запрос."
-
-    try:
-        final_state = await agent_app.ainvoke(inputs, config=config)
-        final_messages: list[AnyMessage] = final_state.get("messages", [])
-        if final_messages and isinstance(final_messages[-1], AIMessage):
-            final_response = final_messages[-1].content
-            logger.info(f"Агент завершил работу для thread_id: {thread_id}.")
-            # --- Добавляем в FAQ, если вопрос про Яндекс Клауд и ответа ещё нет ---
-            if "яндекс" in text.lower():
-                with connection.get_db_session() as db:
-                    # Проверяем, есть ли похожий вопрос
-                    similar = crud.search_faq_entries(db, text, limit=1)
-                    if not similar:
-                        crud.add_faq_entry(db, question=text, answer=final_response)
-        else:
-             logger.warning(f"Агент завершился, но не найдено финального AIMessage для thread_id: {thread_id}")
-    except Exception as e:
-        logger.error(f"Ошибка при вызове агента для user {user_id} в чате {chat_id}: {e}", exc_info=True)
-        final_response = "Извините, произошла внутренняя ошибка при обработке вашего запроса."
-
-    await context.bot.send_message(chat_id=chat_id, text=final_response)
-
-# --- Обработчики Telegram --- #
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я QA-бот на базе YandexGPT. Спроси меня что-нибудь или пришли картинку с текстом!")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    chat_id = message.chat_id
-    user_id = message.from_user.id
-    message_text = message.text
-
-    if not message_text:
-        return
-
-    # Реакция на "спасибо"
-    if message_text.strip().lower() in ["спасибо", "спасибо!", "благодарю"]:
-        await message.reply_text("Пожалуйста! Если будут ещё вопросы — обращайтесь.")
-        return
-
-    # Реакция на "это не то"
-    if "это не то" in message_text.lower() or "не совсем то" in message_text.lower():
-        await message.reply_text("Извините, что не попал в точку. Можете уточнить, что именно вы хотели узнать?")
-        return
-
-    should_respond = False
-    if message.chat.type == "private":
-        should_respond = True
-    elif message.chat.type in ["group", "supergroup"]:
-        mentioned = f"@{BOT_USERNAME}" in message_text
-        is_reply_to_bot = (
-            message.reply_to_message and 
-            message.reply_to_message.from_user.username == BOT_USERNAME
+# Добавляем первого админа из .env в БД при первом запуске, если его там нет
+def ensure_initial_admin():
+    if not ADMIN_IDS:
+        logger.warning(
+            "Нет ADMIN_USER_IDS в .env, не могу добавить первоначального админа."
         )
-        if mentioned:
-            should_respond = True
-            message_text = message_text.replace(f"@{BOT_USERNAME}", "").strip()
-            logger.info(f"Бот упомянут в чате {chat_id}.")
-        elif is_reply_to_bot:
-            should_respond = True
-            logger.info(f"Сообщение является ответом на сообщение бота в чате {chat_id}.")
-        else:
-            # Новый блок: если не упомянут и не reply, проверяем контекст
-            # Импортируй функцию analyze_context из agent_executor
-            from agent.agent_executor import analyze_context
-            context_info = {
-                "chat_type": message.chat.type,
-                "is_mentioned": False,
-                "is_reply_to_bot": False,
-                "message_time": message.date,
-                "chat_id": chat_id,
-                "user_id": user_id,
-                "username": message.from_user.username,
-                "message_text": message_text,
-                "previous_messages": []  # Можно добавить историю, если нужно
-            }
-            state = {"context": context_info}
-            result = analyze_context(state)
-            if result.get("should_respond") and "яндекс" in message_text.lower():
-                should_respond = True
-
-    if not should_respond:
         return
 
-    await run_agent_for_user(user_id, chat_id, message_text, context)
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    chat_id = message.chat_id
-    user_id = message.from_user.id
-
-    if not OCR_READER:
-        logger.warning(f"Получено фото от user {user_id} в чате {chat_id}, но OCR не инициализирован.")
-        await message.reply_text("Извините, я пока не умею обрабатывать изображения.")
-        return
-
-    logger.info(f"Получено фото от user {user_id} в чате {chat_id}. Попытка распознать текст...")
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    try:
-        photo_file = await message.photo[-1].get_file()
-        file_bytes = await photo_file.download_as_bytearray()
-        image_bytes = bytes(file_bytes)
-
-        ocr_result = OCR_READER.readtext(image_bytes)
-
-        if not ocr_result:
-            logger.info("Текст на изображении не распознан.")
-            await message.reply_text("Не удалось распознать текст на этом изображении.")
-            return
-
-        extracted_text = " ".join([res[1] for res in ocr_result])
-        logger.info(f"Распознанный текст: {extracted_text[:200]}...")
-
-        agent_input_text = f"Пользователь прислал картинку. Распознанный текст с картинки: '{extracted_text}'. Проанализируй этот текст или ответь на вопрос, если он есть в тексте."
-        
-        await run_agent_for_user(user_id, chat_id, agent_input_text, context)
-
-    except Exception as e:
-        logger.error(f"Ошибка при обработке фото от user {user_id} в чате {chat_id}: {e}", exc_info=True)
-        await message.reply_text("Произошла ошибка при обработке изображения.")
-
-async def cleanup_scheduler(context: ContextTypes.DEFAULT_TYPE):
-    """Планировщик для очистки старых FAQ записей."""
-    logger.info("Запуск планового удаления старых FAQ записей...")
+    first_admin_id = next(iter(ADMIN_IDS))  # Берем первого админа из списка
     try:
         with connection.get_db_session() as db:
             if db:
-                deleted = crud.cleanup_old_faq_entries(db)
-                logger.info(f"Удалено {deleted} старых FAQ записей")
+                admin = get_admin_by_user_id(db, first_admin_id)
+                if not admin:
+                    logger.info(
+                        f"Первый админ (ID: {first_admin_id}) не найден в БД. Добавляю..."
+                    )
+                    # Пытаемся добавить без username, т.к. его может не быть при старте
+                    add_admin(db, first_admin_id, username=None)
+                else:
+                    logger.info(
+                        f"Первый админ (ID: {first_admin_id}) уже существует в БД."
+                    )
             else:
-                logger.error("Не удалось получить сессию БД для очистки")
+                logger.error(
+                    "Не удалось получить сессию БД для проверки/добавления админа."
+                )
     except Exception as e:
-        logger.error(f"Ошибка при выполнении очистки: {e}", exc_info=True)
+        logger.error(
+            f"Ошибка при добавлении первоначального админа в БД: {e}", exc_info=True
+        )
 
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /admin для управления админами."""
-    message = update.message
-    user_id = message.from_user.id
-    username = message.from_user.username
 
-    # Проверяем, является ли пользователь супер-админом (из .env)
-    if str(user_id) not in ADMIN_USER_IDS_STR.split(","):
-        await message.reply_text("У вас нет прав для использования этой команды.")
-        return
+# --- Инициализация Redis Cache ---
+redis_cache_instance = None
+try:
+    # Инициализируем RedisCache без URL, он сам возьмет переменные окружения
+    redis_cache_instance = RedisCache()
+    # Проверка соединения
+    if redis_cache_instance.ping():
+        logger.info(
+            f"Успешное подключение к Redis: {os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/{os.getenv('REDIS_DB')}"
+        )
+    else:
+        logger.error("Не удалось подключиться к Redis. Кеширование будет отключено.")
+        redis_cache_instance = None
+except Exception as e:
+    logger.error(f"Ошибка при инициализации Redis кэша: {e}", exc_info=True)
+    redis_cache_instance = None
 
-    # Получаем аргументы команды
-    args = context.args
-    if not args:
-        await message.reply_text("Использование: /admin add|remove|list user_id")
-        return
+# --- Инициализация OCR ---
+OCR_READER = None
+try:
+    # Указываем директорию для моделей, если нужно
+    # model_storage_directory = os.path.join(os.getcwd(), '.model_cache')
+    # os.makedirs(model_storage_directory, exist_ok=True)
+    OCR_READER = easyocr.Reader(
+        ["ru", "en"],
+        gpu=False,  # Установить в True, если есть GPU и нужные библиотеки
+        # model_storage_directory=model_storage_directory,
+        # download_enabled=True # Разрешить скачивание моделей
+    )
+    logger.info("OCR Reader (easyocr) инициализирован для языков [ru, en].")
+except Exception as e:
+    logger.error(
+        f"Ошибка инициализации OCR Reader: {e}. Обработка изображений будет недоступна.",
+        exc_info=True,
+    )
+    OCR_READER = None  # Убедимся, что None если ошибка
 
-    action = args[0].lower()
-    
+# --- Инициализация Агента LangGraph ---
+agent_app = None
+checkpoint_db_connection = None  # Для хранения соединения с БД чекпоинтера
+
+
+# Обертка для асинхронной инициализации агента
+async def initialize_bot_resources():
+    """Асинхронно инициализирует все ресурсы бота, включая агент."""
+    global agent_app, checkpoint_db_connection, redis_cache_instance, OCR_READER
+
+    # Инициализация Redis
+    redis_cache_instance = None
     try:
-        with connection.get_db_session() as db:
-            if not db:
-                await message.reply_text("Ошибка подключения к БД")
-                return
+        redis_cache_instance = RedisCache()
+        if await asyncio.to_thread(
+            redis_cache_instance.ping
+        ):  # Выполняем ping в потоке
+            logger.info(
+                f"Успешное подключение к Redis: {os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/{os.getenv('REDIS_DB')}"
+            )
+        else:
+            logger.error(
+                "Не удалось подключиться к Redis. Кеширование будет отключено."
+            )
+            redis_cache_instance = None
+    except Exception as e:
+        logger.error(f"Ошибка при инициализации Redis кэша: {e}", exc_info=True)
+        redis_cache_instance = None
 
-            if action == "list":
-                admins = crud.get_all_active_admins(db)
-                if not admins:
-                    await message.reply_text("Список админов пуст")
-                    return
-                admin_list = "\n".join([f"ID: {admin.user_id}, Username: @{admin.username or 'N/A'}" for admin in admins])
-                await message.reply_text(f"Список активных админов:\n{admin_list}")
-                return
+    # Инициализация OCR
+    OCR_READER = None
+    try:
+        OCR_READER = await asyncio.to_thread(easyocr.Reader, ["ru", "en"], gpu=False)
+        logger.info("OCR Reader (easyocr) инициализирован для языков [ru, en].")
+    except Exception as e:
+        logger.error(
+            f"Ошибка инициализации OCR Reader: {e}. Обработка изображений будет недоступна.",
+            exc_info=True,
+        )
+        OCR_READER = None
 
-            if len(args) < 2:
-                await message.reply_text("Необходимо указать user_id")
-                return
-
+    # Инициализация Агента LangGraph
+    try:
+        agent_app_tuple = await setup_agent()
+        if (
+            agent_app_tuple
+            and agent_app_tuple[0] is not None
+            and agent_app_tuple[1] is not None
+        ):
+            agent_app, checkpoint_db_connection = agent_app_tuple
+            logger.info("Агент и соединение с БД чекпоинтера успешно инициализированы.")
+        else:
+            logger.critical(
+                "Не удалось настроить приложение агента или соединение с БД чекпоинтера. Завершение работы."
+            )
+            if agent_app_tuple and agent_app_tuple[1]:
+                await agent_app_tuple[1].close()
+            sys.exit(1)
+    except Exception as e:
+        logger.critical(
+            f"Критическая ошибка при асинхронной инициализации агента: {e}",
+            exc_info=True,
+        )
+        if checkpoint_db_connection:
             try:
-                target_user_id = int(args[1])
-            except ValueError:
-                await message.reply_text("user_id должен быть числом")
-                return
+                await checkpoint_db_connection.close()
+            except Exception as close_e:
+                logger.error(
+                    f"Ошибка при закрытии checkpoint_db_connection после сбоя инициализации: {close_e}"
+                )
+        sys.exit(1)
 
-            if action == "add":
-                if crud.add_admin(db, target_user_id):
-                    await message.reply_text(f"Админ {target_user_id} успешно добавлен")
-                else:
-                    await message.reply_text("Ошибка при добавлении админа")
 
-            elif action == "remove":
-                if crud.deactivate_admin(db, target_user_id):
-                    await message.reply_text(f"Админ {target_user_id} деактивирован")
-                else:
-                    await message.reply_text("Админ не найден или уже деактивирован")
+# --- Основная функция запуска бота ---
+async def main() -> None:
+    """Инициализирует ресурсы, настраивает и запускает бота."""
+    # 0. Захват блокировки файла (до инициализации ресурсов)
+    if not acquire_lock():
+        sys.exit(1)
 
-            else:
-                await message.reply_text("Неизвестное действие. Используйте: add, remove или list")
-
-    except Exception as e:
-        logger.error(f"Ошибка в команде admin: {e}", exc_info=True)
-        await message.reply_text("Произошла ошибка при выполнении команды")
-
-async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик добавления бота в группу."""
-    chat_id = update.message.chat_id
-    new_members = update.message.new_chat_members
-    
-    # Проверяем, добавлен ли наш бот
-    bot_added = any(member.id == context.bot.id for member in new_members)
-    
-    if bot_added:
-        logger.info(f"Бот добавлен в чат {chat_id}")
-        try:
-            # Приветственное сообщение
-            welcome_message = (
-                "Привет! Я бот для поиска информации. "
-                "Я уже загрузил историю чата и готов помочь с поиском. "
-                "Чтобы задать вопрос, просто напишите его или упомяните меня через @."
-            )
-            await context.bot.send_message(chat_id=chat_id, text=welcome_message)
-            
-        except Exception as e:
-            logger.error(f"Ошибка при обработке добавления бота в чат {chat_id}: {e}", exc_info=True)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Произошла ошибка при инициализации бота. Пожалуйста, попробуйте позже."
-            )
-
-def handle_shutdown(signum, frame, lock_fd=None):
-    """Обработчик сигналов завершения."""
-    logger.info("Получен сигнал завершения, освобождаем ресурсы...")
-    if lock_fd:
-        release_lock(lock_fd)
-    sys.exit(0)
-
-def main():
-    """Основная функция запуска бота."""
-    lock_fd = acquire_lock()
-    
+    application = None  # Определяем application здесь для finally
     try:
-        # Инициализация приложения
-        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        
-        # Добавление обработчиков
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-        application.add_handler(CommandHandler("admin", admin_command))
-        application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_chat_members))
-        
-        # Запуск бота в режиме polling
-        logger.info("Бот запущен в режиме polling")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-        
+        # 1. Асинхронная инициализация всех ресурсов
+        logger.info("Инициализация ресурсов бота...")
+        await initialize_bot_resources()
+        logger.info("Ресурсы бота успешно инициализированы.")
+
+        # 2. Гарантируем наличие первого админа в БД (синхронная операция)
+        ensure_initial_admin()
+
+        # 3. Настройка приложения Telegram
+        logger.info("Настройка приложения Telegram...")
+        defaults = Defaults(parse_mode=ParseMode.MARKDOWN)
+        application = (
+            ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).defaults(defaults).build()
+        )
+
+        # 4. Сохранение важных данных в bot_data
+        application.bot_data["agent_app"] = agent_app
+        application.bot_data["ocr_reader"] = OCR_READER
+        application.bot_data["admin_ids"] = ADMIN_IDS
+        application.bot_data["bot_username"] = BOT_USERNAME
+        application.bot_data["redis_cache"] = redis_cache_instance
+        application.bot_data["days_to_keep_faq"] = int(
+            os.getenv("DAYS_TO_KEEP_FAQ", "365")
+        )
+        application.bot_data["days_to_keep_history"] = int(
+            os.getenv("DAYS_TO_KEEP_CHAT_HISTORY", "30")
+        )
+
+        # 5. Регистрация обработчиков
+        handlers.setup_handlers(
+            application
+        )  # Передаем application в функцию настройки хендлеров
+        logger.info("Обработчики команд и сообщений зарегистрированы.")
+
+        # 6. Настройка и запуск планировщика задач
+        jobs.setup_jobs(application)  # Передаем application в функцию настройки задач
+        logger.info("Планировщик задач настроен.")
+
+        # 7. Установка команд бота
+        async def set_commands(app: Application):
+            try:
+                await app.bot.set_my_commands(handlers.DEFAULT_COMMANDS)
+                logger.info("Команды бота успешно установлены.")
+            except Exception as e:
+                logger.error(f"Ошибка при установке команд бота: {e}", exc_info=True)
+
+        application.post_init = set_commands
+
+        # 8. Запуск бота
+        logger.info("Запуск бота...")
+        await application.initialize()  # Инициализируем приложение
+        await application.start()  # Запускаем внутренние компоненты
+        await application.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES
+        )  # Начинаем опрос
+        logger.info("Бот успешно запущен и работает.")
+
+        # Поддерживаем работу скрипта (ожидание сигнала остановки)
+        # await application.updater.idle() # Этот метод блокирует и ждет сигналы
+        # Или просто бесконечный цикл
+        while True:
+            await asyncio.sleep(3600)  # Проверка каждые N секунд
+
+    except (KeyboardInterrupt, SystemExit) as e:
+        logger.warning(
+            f"Получен сигнал остановки ({type(e).__name__}). Завершение работы..."
+        )
+        # Логика остановки будет в finally
     except Exception as e:
-        logger.critical(f"Критическая ошибка при запуске бота: {e}", exc_info=True)
+        logger.critical(f"Критическая ошибка во время работы бота: {e}", exc_info=True)
     finally:
-        release_lock(lock_fd)
+        logger.info("Начало процедуры остановки бота...")
+        if application and application.updater:
+            if application.updater.running:
+                logger.info("Остановка Polling...")
+                await application.updater.stop()
+            else:
+                logger.info("Polling уже был остановлен.")
+        else:
+            logger.warning(
+                "Application или Updater не инициализированы для остановки polling."
+            )
+
+        if application:
+            logger.info("Остановка Application...")
+            await application.stop()
+            await application.shutdown()
+            logger.info("Application остановлен.")
+        else:
+            logger.warning(
+                "Application не был инициализирован для вызова stop/shutdown."
+            )
+
+        logger.info("Закрытие соединения с БД чекпоинтера...")
+        if checkpoint_db_connection:
+            try:
+                await checkpoint_db_connection.close()
+                logger.info("Соединение aiosqlite для checkpointer успешно закрыто.")
+            except Exception as e:
+                logger.error(
+                    f"Ошибка при закрытии соединения aiosqlite для checkpointer: {e}",
+                    exc_info=True,
+                )
+        else:
+            logger.info("Соединение aiosqlite не было открыто или уже закрыто.")
+
+        logger.info("Освобождение блокировки файла...")
+        release_lock()
+        logger.info("Все ресурсы освобождены. Выход.")
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
