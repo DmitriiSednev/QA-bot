@@ -4,11 +4,18 @@ import os
 import re  # Импортируем regex для парсинга
 
 from dotenv import load_dotenv
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
 # --- Import Agent Logic ---
-from agent import setup_agent  # AgentState не нужен напрямую
-from langchain_core.messages import HumanMessage
+from agent.agent_executor import setup_agent
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
 # --- Инструменты больше не импортируем и не вызываем напрямую ---
 # from agent.tools.add_faq import AddFAQTool, AddFAQInput
@@ -17,71 +24,119 @@ from langchain_core.messages import HumanMessage
 
 # Configure logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    level=logging.INFO,  # Устанавливаем INFO, чтобы видеть сообщения от агента
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),  # Вывод в консоль
+        # logging.FileHandler("bot.log") # Опционально: запись в файл
+    ],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)  # Quieten httpx logs
 logger = logging.getLogger(__name__)
 
 # --- Placeholder Handlers (will be replaced by agent logic) ---
 
+# Глобальная переменная для хранения экземпляра агента (скомпилированного графа)
+# Это упрощение для примера. В продакшене рассмотрите более надежное управление состоянием.
+global_agent_executor = None
 
-async def start(update, context):
-    """Sends a welcome message when the /start command is issued."""
-    user = update.effective_user
-    await update.message.reply_html(
-        rf"Привет {user.mention_html()}! Я QA бот. Спроси меня что-нибудь.",
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /start."""
+    logger.info(f"Команда /start от пользователя {update.effective_user.id}")
+    await update.message.reply_text(
+        "Привет! Я QA-бот на основе LangGraph. Задайте мне вопрос."
     )
 
 
-async def handle_message(update, context):
-    """Handles regular messages, passing them to the agent executor."""
-    user_message_text = update.message.text
-    chat_id = update.message.chat_id  # Used as thread_id
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает текстовые сообщения от пользователя."""
+    global global_agent_executor
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    message_text = update.message.text
 
-    logger.info(f"Получено сообщение от {chat_id}: {user_message_text}")
+    logger.info(
+        f"Сообщение от пользователя {user_id} в чате {chat_id}: '{message_text}'"
+    )
 
-    if "agent_executor" not in context.bot_data:
-        logger.error("Agent executor не инициализирован в context.bot_data!")
-        await update.message.reply_text("Ошибка: Агент не готов.")
+    if global_agent_executor is None:
+        logger.error("Агент не инициализирован. Сообщение не будет обработано.")
+        await update.message.reply_text(
+            "Извините, у меня технические неполадки. Агент не загружен."
+        )
         return
 
-    agent_executor = context.bot_data["agent_executor"]
-    config = {"configurable": {"thread_id": str(chat_id)}}
+    # Уникальный ID для сессии пользователя (можно использовать user_id или chat_id)
+    # Для LangGraph важно передавать один и тот же thread_id для продолжения диалога
+    thread_id = f"telegram_{user_id}_{chat_id}"
+    config = {"configurable": {"thread_id": thread_id}}
 
-    # Просто передаем сообщение пользователя агенту
-    initial_state = {"messages": [HumanMessage(content=user_message_text)]}
+    # Начальное состояние для агента (только сообщение пользователя)
+    # AgentState ожидает messages как Sequence[BaseMessage]
+    initial_state = {"messages": [HumanMessage(content=message_text)]}
 
-    # --- Вызов агента --- (всегда с одним сообщением)
     try:
-        logger.info(f"Вызов агента с начальным состоянием: {initial_state}")
-        final_state = await agent_executor.ainvoke(initial_state, config=config)
-        logger.info(f"Полное состояние от агента: {final_state}")
+        # Используем stream для получения событий от графа
+        # Вместо invoke, чтобы иметь возможность обрабатывать промежуточные шаги или просто получить конечный результат
+        final_response_content = ""
+        async for event in global_agent_executor.astream(initial_state, config=config):
+            # logger.debug(f"Событие от агента: {event}") # Очень многословно
+            # Нас интересует конечное событие, которое обычно является словарем с ключом "messages"
+            # или конкретный узел, возвращающий финальный AIMessage.
+            # Ищем ключ 'messages' в данных события последнего узла (END)
+            # Структура событий зависит от версии LangGraph и того, как настроен граф.
+            # Обычно последнее событие от узла перед END содержит финальное состояние.
 
-        # --- Извлечение ответа --- (ищем последнее сообщение AI)
-        agent_response = "(Пустой ответ от агента)"
-        if final_state and "messages" in final_state and final_state["messages"]:
-            last_message = final_state["messages"][-1]
+            # Пример: если последний узел, который мы ожидаем перед END, это 'output_guardrails'
+            # и он возвращает состояние с обновленными messages.
+            # Или если мы смотрим на событие от самого узла END, у него есть data['output']
+            if (
+                event.get("event") == "on_chain_end"
+                and event.get("name") == "LangGraph"
+            ):  # Общее завершение графа
+                final_state = event.get("data", {}).get("output")
+                if (
+                    final_state
+                    and isinstance(final_state, dict)
+                    and "messages" in final_state
+                ):
+                    if final_state["messages"] and isinstance(
+                        final_state["messages"][-1], AIMessage
+                    ):
+                        final_response_content = final_state["messages"][-1].content
+                        logger.info(
+                            f"Финальный ответ агента для пользователя {user_id}: {final_response_content}"
+                        )
+                        break  # Получили финальный ответ
 
-            # Ищем последний ответ AI
-            if last_message.type == "ai":
-                agent_response = last_message.content
-            else:
-                # Если последний - не AI (например, ToolMessage), ищем предыдущий AI
-                logger.warning(
-                    f"Последнее сообщение не AI ({last_message.type}). Ищем предыдущее AI."
-                )
-                for msg in reversed(final_state["messages"]):
-                    if msg.type == "ai":
-                        agent_response = msg.content
-                        break
-
-        await update.message.reply_text(agent_response)
+        if not final_response_content:
+            # Если после стрима не нашли подходящего ответа (маловероятно, если граф доходит до END)
+            logger.warning(
+                f"Не удалось извлечь финальный ответ из стрима агента для пользователя {user_id}."
+            )
+            # Попытка получить последнее сообщение из invoke, если stream не дал результата
+            # Это может быть медленнее, так как invoke ждет полного выполнения
+            # final_state_invoke = await global_agent_executor.ainvoke(initial_state, config=config)
+            # if final_state_invoke and "messages" in final_state_invoke and final_state_invoke["messages"]:
+            #     final_response_content = final_state_invoke["messages"][-1].content
+            # else:
+            #     final_response_content = "Не удалось получить ответ от агента."
+            # logger.info(f"Финальный ответ агента (через invoke fallback) для пользователя {user_id}: {final_response_content}")
+            # Пока что оставим сообщение об ошибке, если стрим не дал ответа
+            final_response_content = (
+                "К сожалению, я не смог обработать ваш запрос полностью."
+            )
 
     except Exception as e:
-        logger.error(f"Ошибка при вызове агента для чата {chat_id}: {e}", exc_info=True)
-        await update.message.reply_text(
-            "Произошла ошибка при обработке вашего запроса."
+        logger.error(
+            f"Ошибка при вызове агента для пользователя {user_id}: {e}", exc_info=True
         )
+        final_response_content = (
+            f"Извините, произошла ошибка при обработке вашего запроса: {e}"
+        )
+
+    await update.message.reply_text(final_response_content)
 
 
 # --- Command Handlers --- (УДАЛЯЕМ add_faq_command, update_faq_command, delete_faq_command)
@@ -95,49 +150,49 @@ async def handle_message(update, context):
 
 
 def main() -> None:
-    """Start the bot."""
-    # Load environment variables
-    load_dotenv()
+    """Запускает бота."""
+    global global_agent_executor
+    load_dotenv()  # Загружаем переменные окружения из .env файла
+    logger.info("Загружены переменные окружения.")
 
-    # Get Telegram Bot Token
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        logger.error("TELEGRAM_BOT_TOKEN не найден в .env файле!")
-        return
-
-    # Create the Application
-    application = Application.builder().token(token).build()
-
-    # --- Setup Agent --- (Вызываем один раз при старте)
+    # Инициализация агента
     try:
-        agent_executor = setup_agent()
-        # Store the agent executor in bot_data for access in handlers
-        application.bot_data["agent_executor"] = agent_executor
-        logger.info("Agent executor успешно создан и сохранен в bot_data.")
+        logger.info("Инициализация агента...")
+        global_agent_executor = setup_agent()
+        if global_agent_executor:
+            logger.info("Агент успешно инициализирован.")
+        else:
+            logger.error(
+                "Не удалось инициализировать агент! Бот может работать некорректно."
+            )
+            # Можно здесь завершить работу, если агент критичен
+            # return
     except Exception as e:
-        logger.error(
-            f"Критическая ошибка при создании agent_executor: {e}", exc_info=True
-        )
-        # Exit or handle gracefully if the agent is essential
+        logger.error(f"Критическая ошибка при инициализации агента: {e}", exc_info=True)
+        # Завершаем работу, если агент не может быть создан
         return
 
-    # --- Register Handlers ---
-    # Register the /start command handler
+    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not telegram_bot_token:
+        logger.error(
+            "TELEGRAM_BOT_TOKEN не найден в переменных окружения. Бот не может быть запущен."
+        )
+        return
+
+    logger.info("Создание приложения Telegram...")
+    application = Application.builder().token(telegram_bot_token).build()
+
+    # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
+    logger.info("Обработчики команд и сообщений зарегистрированы.")
 
-    # Register command handlers (УДАЛЯЕМ add/update/delete)
-    # application.add_handler(CommandHandler("add_faq", add_faq_command))
-    # application.add_handler(CommandHandler("update_faq", update_faq_command))
-    # application.add_handler(CommandHandler("delete_faq", delete_faq_command))
-
-    # Register the message handler for non-command messages
-    # Используем filters.TEXT и НЕ filters.COMMAND, чтобы он ловил всё, КРОМЕ команд ТГ
-    # Наш парсинг внутри handle_message разберется с "командами" типа /add_faq
-    application.add_handler(MessageHandler(filters.TEXT, handle_message))
-
-    # Run the bot until the user presses Ctrl-C
-    logger.info("Бот запускается...")
+    # Запуск бота
+    logger.info("Запуск бота...")
     application.run_polling()
+    logger.info("Бот остановлен.")
 
 
 if __name__ == "__main__":

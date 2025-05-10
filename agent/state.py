@@ -26,3 +26,11 @@ class AgentState(TypedDict):
     faq_search_result: Optional[str] = None  # Результат поиска по FAQ
     current_tool_call_id: Optional[str] = None
     tool_name_executed: Optional[str] = None
+
+
+def response_generator_node(state: AgentState, llm):
+    # ... существующий код ...
+    context = ""
+    if state.get("tool_result"):
+        context += f"Контекст из документации Yandex Cloud:\n{state['tool_result']}\n"
+    # ... остальной prompt ...

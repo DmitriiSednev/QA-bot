@@ -18,44 +18,59 @@ class SearchFAQInput(BaseModel):
 
 
 class SearchFAQTool(BaseTool):
-    """Инструмент для поиска релевантных записей в базе знаний FAQ."""
-
     name: str = "search_faq"
-    description: str = (
-        "Используй этот инструмент для поиска ответов на вопросы пользователя "
-        "во внутренней базе знаний (FAQ). Особенно полезен для вопросов, "
-        "касающихся специфики проекта или ранее обсуждавшихся тем. "
-        "Входными данными должен быть поисковый запрос (вопрос пользователя)."
-    )
+    description: str = "Ищет релевантные записи в базе знаний FAQ по тексту вопроса."
     args_schema: Type[BaseModel] = SearchFAQInput
 
-    def _run(
-        self, query: str, run_manager: CallbackManagerForToolRun | None = None
-    ) -> str:
-        """Ищет записи в FAQ и возвращает найденные результаты."""
-        logger.info(f"Запуск SearchFAQTool с запросом: {query}")
-        results_str = "В базе знаний FAQ не найдено релевантных записей."
+    def _run(self, query: str) -> str:
+        with connection.get_db_session() as db:
+            if not db:
+                return "Ошибка: не удалось подключиться к базе данных."
+            results = crud.search_faq_entries(db, query)
+            if not results:
+                return "Ничего не найдено в базе знаний FAQ."
+            return "\n".join([f"Q: {r.question}\nA: {r.answer}" for r in results[:3]])
 
-        try:
-            with connection.get_db_session() as db:
-                if not db:
-                    return "Ошибка: Не удалось получить сессию базы данных."
 
-                # Используем функцию поиска из crud.py
-                # TODO: Заменить на векторный поиск позже
-                search_results: List[models.FAQEntry] = crud.search_faq_entries(
-                    db, query, limit=3  # Ограничим пока 3 результатами
-                )
-
-                if search_results:
-                    results_str = "Найдены следующие записи в FAQ:\n\n"
-                    for entry in search_results:
-                        results_str += f"Q: {entry.question}\nA: {entry.answer}\n\n"
-
-            return results_str.strip()
-
-        except Exception as e:
-            logger.error(
-                f"Ошибка в SearchFAQTool при запросе '{query}': {e}", exc_info=True
-            )
-            return f"Произошла ошибка при поиске в FAQ: {e}"
+# class SearchFAQTool(BaseTool):
+#     """Инструмент для поиска релевантных записей в базе знаний FAQ."""
+#
+#     name: str = "search_faq"
+#     description: str = (
+#         "Используй этот инструмент для поиска ответов на вопросы пользователя "
+#         "во внутренней базе знаний (FAQ). Особенно полезен для вопросов, "
+#         "касающихся специфики проекта или ранее обсуждавшихся тем. "
+#         "Входными данными должен быть поисковый запрос (вопрос пользователя)."
+#     )
+#     args_schema: Type[BaseModel] = SearchFAQInput
+#
+#     def _run(
+#         self, query: str, run_manager: CallbackManagerForToolRun | None = None
+#     ) -> str:
+#         """Ищет записи в FAQ и возвращает найденные результаты."""
+#         logger.info(f"Запуск SearchFAQTool с запросом: {query}")
+#         results_str = "В базе знаний FAQ не найдено релевантных записей."
+#
+#         try:
+#             with connection.get_db_session() as db:
+#                 if not db:
+#                     return "Ошибка: Не удалось получить сессию базы данных."
+#
+#                 # Используем функцию поиска из crud.py
+#                 # TODO: Заменить на векторный поиск позже
+#                 search_results: List[models.FAQEntry] = crud.search_faq_entries(
+#                     db, query, limit=3  # Ограничим пока 3 результатами
+#                 )
+#
+#                 if search_results:
+#                     results_str = "Найдены следующие записи в FAQ:\n\n"
+#                     for entry in search_results:
+#                         results_str += f"Q: {entry.question}\nA: {entry.answer}\n\n"
+#
+#             return results_str.strip()
+#
+#         except Exception as e:
+#             logger.error(
+#                 f"Ошибка в SearchFAQTool при запросе '{query}': {e}", exc_info=True
+#             )
+#             return f"Произошла ошибка при поиске в FAQ: {e}"
