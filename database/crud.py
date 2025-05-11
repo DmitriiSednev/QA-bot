@@ -13,20 +13,26 @@ from . import models
 logger = logging.getLogger(__name__)
 
 # --- Инициализация Эмбеддера ---
-# Использует OPENAI_API_KEY и OPENAI_API_BASE из .env
+# Использует api_key и base_url из .env
 try:
     # Убедимся, что нужные переменные есть
-    if not os.getenv("OPENAI_API_KEY") or not os.getenv("OPENAI_API_BASE"):
+    proxy_api_key = os.getenv("api_key")  # Используем новое имя
+    proxy_base_url = os.getenv("base_url")  # Используем новое имя
+
+    if not proxy_api_key or not proxy_base_url:
         raise ValueError(
-            "API ключ или базовый URL OpenAI не найдены в .env для эмбеддингов"
+            "Ключ API (api_key) и базовый URL (base_url) для OpenAI-совместимого API "
+            "должны быть указаны в .env для эмбеддингов."
         )
     embeddings_model = OpenAIEmbeddings(
         # Можно указать конкретную модель, если нужно, иначе по умолчанию
         # model="text-embedding-ada-002"
-        openai_api_key=os.environ["OPENAI_API_KEY"],
-        openai_api_base=os.environ["OPENAI_API_BASE"],
+        openai_api_key=proxy_api_key,  # Передаем proxy_api_key
+        openai_api_base=proxy_base_url,  # Передаем proxy_base_url
     )
-    logger.info("Модель эмбеддингов OpenAI инициализирована.")
+    logger.info(
+        f"Модель эмбеддингов OpenAI инициализирована с базовым URL: {proxy_base_url}."
+    )
 except Exception as e:
     logger.error(f"Ошибка инициализации модели эмбеддингов: {e}", exc_info=True)
     embeddings_model = None  # Устанавливаем в None, чтобы CRUD функции могли проверить

@@ -4,6 +4,7 @@ import os
 import functools
 import uuid  # Для генерации фейкового tool_call_id
 from typing import Sequence, Literal, Dict, Any
+import json
 
 from langchain_core.messages import (
     BaseMessage,
@@ -130,35 +131,296 @@ def router_node(state: AgentState, llm: ChatOpenAI):
         )
         return {"next_node": "generate_response", "messages": messages + [error_ai_msg]}
 
-    llm_with_tools = llm.bind_tools(list(tool_registry.values()))
-
     if isinstance(last_message, ToolMessage):
         logger.info(
             "Последнее сообщение - результат инструмента. Переход к генерации ответа."
         )
-        # Важно: сообщения уже должны содержать ToolMessage, не нужно его дублировать.
-        # next_node указывает графу, что делать дальше.
-        return {
-            "next_node": "generate_response"
-        }  # Сообщения не меняем, они уже в state
+        return {"next_node": "generate_response"}
 
-    logger.info("Запрос к LLM-роутеру с привязанными инструментами...")
+    logger.info("Запрос к LLM-роутеру с ЯВНО ПЕРЕДАННЫМИ инструментами...")
     try:
-        ai_message: AIMessage = llm_with_tools.invoke(messages)
-        logger.info(f"Ответ LLM-роутера: {ai_message}")
+        # Формируем описания инструментов для явной передачи и для системного промпта
+        formatted_tools_for_router = []
+        tool_descriptions_for_prompt_list = []
+        for tool_name, tool_instance in tool_registry.items():
+            formatted_tools_for_router.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_instance.name,
+                        "description": tool_instance.description,
+                        "parameters": (
+                            tool_instance.args_schema.schema()
+                            if tool_instance.args_schema
+                            else {}
+                        ),
+                    },
+                }
+            )
+            tool_descriptions_for_prompt_list.append(
+                f"- {tool_instance.name}: {tool_instance.description}"
+            )
 
-        if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-            logger.info("Router node: LLM не выбрала инструмент.")
+        if not formatted_tools_for_router:
+            logger.error(
+                "Не удалось сформировать описания инструментов для LLM-роутера (список пуст)."
+            )
+            error_ai_msg = AIMessage(
+                content="Внутренняя ошибка: не удалось подготовить инструменты для LLM."
+            )
             return {
                 "next_node": "generate_response",
-                "messages": messages
-                + [ai_message],  # Добавляем ai_message (без tool_calls) к истории
+                "messages": messages + [error_ai_msg],
             }
 
-        # Важно: Добавляем AIMessage с tool_calls в историю ДО того, как передать управление tool_executor'у
-        updated_messages = messages + [ai_message]
+        tool_descriptions_str = "\n".join(tool_descriptions_for_prompt_list)
 
-        tool_call = ai_message.tool_calls[0]
+        # Новый ОЧЕНЬ ДИРЕКТИВНЫЙ системный промпт для роутера
+        router_system_prompt = f"""Твоя единственная задача - маршрутизация запроса пользователя.
+
+Доступные инструменты:
+{tool_descriptions_str}
+
+Правила:
+1. Проанализируй ПОСЛЕДНИЙ запрос пользователя.
+2. Если запрос касается Yandex Cloud (например, 'как настроить ВМ', 'сервисы Yandex Cloud', 'ошибки Yandex Cloud', 'подключение к Yandex Cloud', 'документация Yandex Cloud'):
+   Ты ОБЯЗАН вызвать инструмент 'tavily_yandexcloud_search'.
+   Аргументом 'query' для этого инструмента должен быть ПОЛНЫЙ ТЕКСТ последнего запроса пользователя.
+   Твой ответ ДОЛЖЕН быть ТОЛЬКО JSON объект в поле 'tool_calls' сообщения. Этот JSON должен быть массивом, содержащим один объект вызова функции.
+   Пример формата ТОЛЬКО для 'tool_calls', если пользователь спросил "Как настроить VPN в Yandex Cloud?":
+   `[ {{"id": "call_random_id_123", "type": "function", "function": {{"name": "tavily_yandexcloud_search", "arguments": "{{\"query\": \"Как настроить VPN в Yandex Cloud?\"}}"}}}} ]`
+   НЕ ДОБАВЛЯЙ НИКАКОГО ДРУГОГО ТЕКСТА, ПОЯСНЕНИЙ ИЛИ КОММЕНТАРИЕВ В ТВОЙ ОТВЕТ. ТОЛЬКО `tool_calls`.
+3. Если запрос НЕ о Yandex Cloud:
+   Рассмотри другие инструменты ('web_search' для общих вопросов, 'search_faq', 'add_faq', 'update_faq', 'delete_faq' для работы с базой знаний).
+   Если подходящий инструмент найден, используй тот же формат ответа ТОЛЬКО с 'tool_calls'.
+   Если ни один инструмент не подходит, и ты можешь ответить сам, сгенерируй прямой текстовый ответ. В этом случае в твоем ответе НЕ ДОЛЖНО БЫТЬ поля 'tool_calls'.
+"""
+
+        # Подготавливаем сообщения для LLM, добавляя системный промпт
+        messages_for_llm_router = [
+            SystemMessage(content=router_system_prompt)
+        ] + messages
+
+        logger.info(
+            f"Передаваемые инструменты в router LLM: {formatted_tools_for_router}"
+        )
+        logger.info(f"Системный промпт для router LLM: \n{router_system_prompt}")
+
+        # Используем базовый llm объект и передаем tools как kwarg
+        ai_message: AIMessage = llm.invoke(
+            messages_for_llm_router, tools=formatted_tools_for_router
+        )
+
+        logger.info(f"Ответ LLM-роутера (сырой объект): {ai_message}")
+        logger.info(f"Тип ai_message: {type(ai_message)}")
+        logger.info(f"Контент ai_message: {ai_message.content}")
+        logger.info(f"additional_kwargs ai_message: {ai_message.additional_kwargs}")
+        logger.info(f"response_metadata ai_message: {ai_message.response_metadata}")
+        logger.info(
+            f"Есть ли атрибут 'tool_calls' у ai_message: {hasattr(ai_message, "tool_calls")}"
+        )
+        if hasattr(ai_message, "tool_calls"):
+            logger.info(f"Значение ai_message.tool_calls: {ai_message.tool_calls}")
+            logger.info(f"Тип ai_message.tool_calls: {type(ai_message.tool_calls)}")
+            if ai_message.tool_calls:
+                logger.info(f"Количество tool_calls: {len(ai_message.tool_calls)}")
+
+        # --- ИСПРАВЛЕНИЕ ЛОГИКИ ИЗВЛЕЧЕНИЯ TOOL_CALLS + ПАРСИНГ ИЗ CONTENT ---
+        tool_calls_list_from_attribute = None
+        if hasattr(ai_message, "tool_calls") and ai_message.tool_calls:
+            tool_calls_list_from_attribute = ai_message.tool_calls
+            logger.info("Извлечены tool_calls из ai_message.tool_calls атрибута")
+
+        tool_calls_extracted_from_content = None
+        # Пытаемся извлечь из content, ЕСЛИ в атрибуте tool_calls пусто ИЛИ additional_kwargs тоже пуст (на всякий случай)
+        # и если content вообще есть
+        if (
+            not tool_calls_list_from_attribute
+            and ai_message.content
+            and isinstance(ai_message.content, str)
+        ):
+            logger.info(
+                "ai_message.tool_calls пусто, но content присутствует. Попытка парсинга content для tool_calls."
+            )
+            try:
+                content_str = ai_message.content.strip()
+                # Удаляем потенциальные markdown code blocks
+                if content_str.startswith("```json"):
+                    content_str = content_str[7:]  # Удаляем ```json
+                elif content_str.startswith("```"):  # Удаляем только ```
+                    content_str = content_str[3:]
+
+                if content_str.endswith("```"):
+                    content_str = content_str[:-3]
+                content_str = content_str.strip()
+
+                if not content_str:
+                    raise ValueError("Content стал пустым после очистки от markdown.")
+
+                parsed_content = json.loads(content_str)
+
+                # Ожидаем, что parsed_content - это список словарей (даже если там один вызов)
+                if isinstance(parsed_content, list) and parsed_content:
+                    # Берем первый элемент, предполагая один вызов инструмента за раз
+                    potential_tool_call_data = parsed_content[0]
+
+                    if (
+                        isinstance(potential_tool_call_data, dict)
+                        and potential_tool_call_data.get("type") == "function"
+                        and isinstance(potential_tool_call_data.get("function"), dict)
+                    ):
+
+                        func_details = potential_tool_call_data["function"]
+                        tool_name = func_details.get("name")
+                        # Аргументы могут быть уже словарем или строкой JSON
+                        raw_arguments = func_details.get("arguments")
+                        tool_id = potential_tool_call_data.get(
+                            "id", f"parsed_call_{uuid.uuid4()}"
+                        )
+
+                        actual_tool_args = {}
+                        if isinstance(raw_arguments, str):
+                            try:
+                                actual_tool_args = json.loads(raw_arguments)
+                            except json.JSONDecodeError:
+                                logger.error(
+                                    f"Ошибка декодирования JSON из строки arguments: {raw_arguments}"
+                                )
+                                # Можно попытаться использовать строку как есть, если инструмент это ожидает,
+                                # или вернуть ошибку/пропустить. Для Tavily нужен dict.
+                        elif isinstance(raw_arguments, dict):
+                            actual_tool_args = raw_arguments
+                        else:
+                            logger.warning(
+                                f"Аргументы инструмента '{tool_name}' имеют неожиданный тип: {type(raw_arguments)}. Ожидался dict или str."
+                            )
+
+                        if tool_name:  # Имя инструмента обязательно
+                            tool_calls_extracted_from_content = [
+                                {
+                                    "id": tool_id,  # Langchain ожидает 'id' на верхнем уровне
+                                    "name": tool_name,  # 'name' тоже
+                                    "args": actual_tool_args,  # 'args' тоже
+                                    # 'type' и 'function' были для парсинга, в tool_calls LangChain они не нужны в таком виде
+                                }
+                            ]
+                            logger.info(
+                                f"Успешно распарсен tool_call из content: {tool_calls_extracted_from_content}"
+                            )
+                        else:
+                            logger.warning(
+                                "Распарсенный tool_call из content не содержит имени инструмента."
+                            )
+                    else:
+                        logger.info(
+                            "Распарсенный content не соответствует ожидаемой структуре tool_call (например, отсутствует type: 'function' или сама 'function')."
+                        )
+                else:
+                    logger.info("Распарсенный content не является списком или пуст.")
+            except json.JSONDecodeError:
+                logger.info(
+                    f"Content не является валидным JSON или не в формате списка: '{ai_message.content[:200]}...'"
+                )
+            except ValueError as ve:
+                logger.info(f"Ошибка при подготовке content для парсинга: {ve}")
+            except Exception as e:
+                logger.error(
+                    f"Неожиданная ошибка при парсинге tool_call из content: {e}",
+                    exc_info=True,
+                )
+
+        # --- Выбор, какие tool_calls использовать ---
+        final_tool_calls_list = None
+        source_of_tool_calls = None  # "attribute", "content", "kwargs"
+
+        if tool_calls_list_from_attribute:
+            final_tool_calls_list = tool_calls_list_from_attribute
+            source_of_tool_calls = "attribute"
+            logger.info("Используются tool_calls из атрибута ai_message.tool_calls.")
+        elif tool_calls_extracted_from_content:
+            final_tool_calls_list = tool_calls_extracted_from_content
+            source_of_tool_calls = "content"
+            logger.info("Используются tool_calls, извлеченные из ai_message.content.")
+        else:
+            # Проверяем additional_kwargs как последний вариант (старый код)
+            if (
+                hasattr(ai_message, "additional_kwargs")
+                and "tool_calls" in ai_message.additional_kwargs
+            ):
+                # ... (код парсинга из additional_kwargs, если он нужен) ...
+                # Заглушка, если понадобится:
+                # parsed_kwargs_tool_calls = _parse_tool_calls_from_kwargs(ai_message.additional_kwargs["tool_calls"])
+                # if parsed_kwargs_tool_calls:
+                #    final_tool_calls_list = parsed_kwargs_tool_calls
+                #    source_of_tool_calls = "kwargs"
+                #    logger.info("Используются tool_calls, извлеченные из ai_message.additional_kwargs.")
+                pass
+
+        if not final_tool_calls_list:  # Если после всех проверок tool_calls_list пуст
+            logger.info(
+                "Router node: LLM не выбрала инструмент или не предоставила корректные tool_calls."
+            )
+
+            # Проверяем, не является ли это случаем, когда LLM сказала "tool_calls", но не дала их,
+            # или дала их в некорректном формате, который не был распарсен.
+            # ai_message - это оригинальный ответ от llm_with_tools.invoke(messages)
+            if (
+                hasattr(ai_message, "response_metadata")
+                and ai_message.response_metadata.get("finish_reason") == "tool_calls"
+                and (not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls)
+            ):
+
+                logger.warning(
+                    f"LLM-роутер ({ai_message.id if hasattr(ai_message, 'id') else 'N/A'}) "
+                    f"вернул finish_reason='tool_calls', но поле tool_calls пустое или отсутствует. "
+                    f"Это некорректное состояние. response_metadata: {ai_message.response_metadata}. "
+                    f"Не добавляем этот AIMessage в историю. "
+                    f"generate_response будет работать с предыдущей историей."
+                )
+                # Возвращаем исходные сообщения, без этого пустого/некорректного AIMessage
+                return {
+                    "next_node": "generate_response",
+                    "messages": messages,  # НЕ messages + [ai_message]
+                }
+            else:
+                # LLM не выбрала инструмент и finish_reason не 'tool_calls' (например, 'stop'),
+                # ИЛИ tool_calls были, но не распарсились (хотя tool_calls_list был бы не пуст тогда).
+                # Этот блок для случая, когда LLM закончила с 'stop' и есть ai_message.content.
+                logger.info(
+                    f"LLM-роутер сгенерировал текстовый ответ (или finish_reason не 'tool_calls'): '{ai_message.content}'"
+                )
+                return {
+                    "next_node": "generate_response",
+                    "messages": messages
+                    + [ai_message],  # Добавляем ai_message с текстовым ответом
+                }
+
+        # --- ОБНОВЛЕНИЕ ЛОГИКИ ДОБАВЛЕНИЯ AIMESSAGE В ИСТОРИЮ ---
+        message_to_add_to_history = ai_message  # По умолчанию оригинальное сообщение
+
+        if source_of_tool_calls == "content" and final_tool_calls_list:
+            logger.info(
+                "Создание нового AIMessage, так как tool_calls были извлечены из content."
+            )
+            # Мы должны создать новый AIMessage, у которого поле tool_calls будет заполнено.
+            # Копируем важные поля из оригинального ai_message.
+            # content оставляем пустым или как есть, в зависимости от того, что правильнее.
+            # Если модель вернула JSON в content, и это был ЕДИНСТВЕННЫЙ ее ответ, то content можно обнулить.
+            # Если она что-то еще сказала текстом, то content оригинального ai_message может быть важен.
+            # Судя по логам, content был ТОЛЬКО JSON вызова.
+            new_ai_message_with_tool_calls = AIMessage(
+                content="",  # Очищаем content, так как вся суть была в tool_calls
+                tool_calls=final_tool_calls_list,  # Используем извлеченные tool_calls
+                id=ai_message.id,  # Сохраняем оригинальный ID
+                response_metadata=ai_message.response_metadata,  # Сохраняем метаданные
+                # name можно не указывать, Langchain справится
+            )
+            message_to_add_to_history = new_ai_message_with_tool_calls
+            logger.info(f"Новый AIMessage для истории: {message_to_add_to_history}")
+
+        updated_messages = messages + [message_to_add_to_history]
+
+        tool_call = final_tool_calls_list[0]
         tool_name = tool_call["name"]
         tool_input = tool_call["args"]
         tool_call_id = tool_call.get("id")
@@ -390,42 +652,40 @@ def handle_tool_result_node(state: AgentState):
 # ОБНОВЛЕННЫЙ ГЕНЕРАТОР ОТВЕТА
 async def response_generator_node(state: AgentState, llm: ChatOpenAI):
     logger.info("--- Вход в Response Generator ---")
-    if TEST_TAVILY_ONLY_MODE:
-        logger.warning(
-            "!!! РЕЖИМ ТЕСТИРОВАНИЯ TAVILY API: Response Generator не будет вызван. !!!"
-        )
-        # Просто возвращаем какое-то сообщение, чтобы граф завершился, если он сюда попадет по ошибке.
-        return {
-            "messages": [
-                AIMessage(content="Тест Tavily завершен. Ответ LLM не генерировался.")
-            ]
-        }
+    messages = state.get("messages", [])
+    if not messages:
+        logger.warning("Нет сообщений для генерации ответа.")
+        return {"messages": [AIMessage(content="Нет входных данных для ответа.")]}
 
-    messages_for_llm = []
-    current_messages = list(state.get("messages", []))
+    # Собираем только контент из BaseMessage для системного промпта,
+    # а сами сообщения передаем как есть.
+    # messages_for_llm = [SystemMessage(content=SYSTEM_PROMPT_RESPONSE_GENERATOR)] + messages
+    # Убираем добавление системного промпта здесь, так как он может быть уже добавлен
+    # или его формат может конфликтовать с ожиданиями модели при tool use.
+    # Лучше управлять системным промптом на уровне конфигурации графа или начального состояния.
+    messages_for_llm = list(messages)  # Копируем, чтобы не изменять оригинальный state
 
-    if not current_messages:
-        logger.error("Нет сообщений в состоянии для генерации ответа.")
-        return {
-            "messages": [
-                AIMessage(content="Внутренняя ошибка: нет сообщений для обработки.")
-            ]
-        }
-
-    # Гарантируем, что SystemMessage будет первым и только один
-    if not isinstance(current_messages[0], SystemMessage):
-        messages_for_llm.append(SystemMessage(content=SYSTEM_PROMPT_RESPONSE_GENERATOR))
-        messages_for_llm.extend(current_messages)
-    else:
-        current_messages[0] = SystemMessage(
-            content=SYSTEM_PROMPT_RESPONSE_GENERATOR
-        )  # Обновляем, если уже есть
-        messages_for_llm.extend(current_messages)
-
-    logger.debug(f"Сообщения, подготовленные для LLM (до вызова): {messages_for_llm}")
-
-    # Валидация последовательности (особенно ToolMessage после AIMessage с tool_calls)
+    # Валидация последовательности сообщений перед отправкой в LLM
+    # (этот код можно вынести в отдельную утилиту, если он будет использоваться еще где-то)
     valid_sequence = True
+    if not messages_for_llm:
+        valid_sequence = False  # Пустая последовательность невалидна для генерации
+    else:
+        # Убедимся, что первое сообщение не ToolMessage или AIMessage без tool_calls
+        first_msg = messages_for_llm[0]
+        if isinstance(first_msg, ToolMessage) or (
+            isinstance(first_msg, AIMessage)
+            and not first_msg.tool_calls
+            and first_msg.content == ""
+        ):
+            # Это не совсем корректно, но для простоты пока так.
+            # В идеале, первая AIMessage в истории не должна быть пустой с tool_calls.
+            logger.warning(
+                f"Первое сообщение в истории для LLM имеет нежелательный тип: {type(first_msg)}"
+            )
+            # valid_sequence = False # Решим, насколько это критично
+
+    # ... (существующий код валидации ToolMessage и AIMessage с tool_calls) ...
     for i in range(1, len(messages_for_llm)):  # Начинаем с 1, так как смотрим на i-1
         current_msg = messages_for_llm[i]
         prev_msg = messages_for_llm[i - 1]
@@ -437,7 +697,6 @@ async def response_generator_node(state: AgentState, llm: ChatOpenAI):
                 )
                 valid_sequence = False
                 break
-            # Дополнительно проверяем, что tool_call_id из ToolMessage есть в tool_calls предыдущего AIMessage
             found_matching_id = any(
                 tc.get("id") == current_msg.tool_call_id for tc in prev_msg.tool_calls
             )
@@ -453,8 +712,69 @@ async def response_generator_node(state: AgentState, llm: ChatOpenAI):
         error_content = "Произошла ошибка при обработке вашего запроса из-за внутренней проблемы с последовательностью вызова инструментов."
         return {"messages": [AIMessage(content=error_content)]}
 
+    # Получаем описания инструментов для передачи в LLM
+    # Это важно, если LLM ожидает их при генерации ответа после ToolMessage
+    tools_for_llm = [
+        tool.name  # Используем только имена или можно передавать схемы, если LLM их поддерживает
+        for tool_name, tool in tool_registry.items()
+    ]
+    # LangChain обычно ожидает формат tool.format_tool_for_openai() или аналогичный.
+    # ChatOpenAI может сам позаботиться о правильном формате, если передать tool_registry
+    # Однако, для простого вызова invoke/ainvoke может потребоваться явная передача `tools`.
+
+    # Проверим, есть ли в истории ToolMessage. Если да, то передадим tools.
+    has_tool_message = any(isinstance(msg, ToolMessage) for msg in messages_for_llm)
+
     try:
-        response_ai_message: AIMessage = await llm.ainvoke(messages_for_llm)
+        if has_tool_message:
+            logger.info(
+                f"Передаем LLM список инструментов: {[tool.name for tool in tool_registry.values()]}"
+            )
+            # Для ChatOpenAI, чтобы он правильно обработал tools, их нужно передавать в .bind_tools()
+            # или правильно сформировать tools параметр для .ainvoke()
+            # Используем .bind_tools для корректной передачи.
+            # llm_with_tools = llm.bind_tools([tool_registry[tool_name] for tool_name in tools_for_llm]) # это если tool_registry содержит сами объекты
+            # На самом деле, router_node уже биндит инструменты к llm.
+            # Если мы просто вызываем llm.ainvoke, и llm уже с привязанными инструментами, этого должно быть достаточно.
+            # Но ошибка "No tools were provided" говорит об обратном для YandexGPT через LiteLLM.
+            # Попробуем передать параметр `tools` явно, если это поддерживается ChatOpenAI.
+            # Стандартный ChatOpenAI.ainvoke принимает messages, stop, config, **kwargs.
+            # Параметр `tools` обычно передается при инициализации или через .bind_tools().
+
+            # Самый надежный способ - это использовать llm.bind_tools, если llm - это ChatOpenAI инстанс
+            # из setup_agent, к которому УЖЕ были привязаны инструменты через .bind_tools в router_node.
+            # Проблема в том, что router_node вызывает llm.invoke, а здесь мы вызываем llm.ainvoke.
+            # llm, переданный в response_generator_node, это тот же самый llm, что и в router_node.
+            # Если инструменты были привязаны в router_node, они должны быть доступны и здесь.
+
+            # Ошибка "No tools were provided" от LiteLLM/YandexGPT намекает, что он ожидает tools в КАЖДОМ запросе,
+            # если в истории есть ToolMessage, а не только в том, который генерирует tool_calls.
+
+            # Соберем описания инструментов в формате, который может ожидать OpenAI/LiteLLM
+            formatted_tools = []
+            for tool_name, tool_instance in tool_registry.items():
+                formatted_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool_instance.name,
+                            "description": tool_instance.description,
+                            "parameters": (
+                                tool_instance.args_schema.schema()
+                                if tool_instance.args_schema
+                                else {}
+                            ),
+                        },
+                    }
+                )
+            logger.info(f"Явно передаем tools в ainvoke: {formatted_tools}")
+            response_ai_message: AIMessage = await llm.ainvoke(
+                messages_for_llm, tools=formatted_tools  # ЯВНАЯ ПЕРЕДАЧА ИНСТРУМЕНТОВ
+            )
+        else:
+            # Если ToolMessage в истории нет, вызываем как обычно
+            response_ai_message: AIMessage = await llm.ainvoke(messages_for_llm)
+
         logger.info(
             f"Получено от LLM: {response_ai_message.content if response_ai_message else 'No content'}"
         )
@@ -549,89 +869,116 @@ def setup_agent():
     logger.info("Инициализация агента...")
 
     llm_model_name = os.getenv("LLM_MODEL")
-    yc_folder_id = os.getenv("YC_FOLDER_ID")
-    yc_api_key = os.getenv("YC_API_KEY")
-    # yc_iam_token = os.getenv("YC_IAM_TOKEN") # Альтернатива api_key
+    # Используем новые имена переменных из .env согласно скриншоту
+    proxy_base_url = os.getenv("base_url")
+    proxy_api_key = os.getenv("api_key")
+
+    # Переменные для YandexGPT (на случай, если LiteLLM их требует или для будущей прямой интеграции)
+    # yc_folder_id = os.getenv("YC_FOLDER_ID")
+    # yc_api_key = os.getenv("YC_API_KEY")
 
     llm = None
 
-    if llm_model_name and llm_model_name.startswith("yandex/") and YANDEX_VERFÜGBAR:
-        model_path_segment = llm_model_name.split("/", 1)[
-            1
-        ]  # yandexgpt/rc -> yandexgpt-rc
-        model_uri = (
-            f"gpt://{yc_folder_id}/{model_path_segment.replace('/', '-')}/latest"
+    if proxy_base_url:  # Проверяем новую переменную proxy_base_url
+        logger.info(
+            f"Обнаружен base_url (прокси): {proxy_base_url}. Используем ChatOpenAI через этот прокси."
         )
-
-        if not yc_folder_id:
+        if not llm_model_name:
             logger.error(
-                "YC_FOLDER_ID не установлен. Невозможно использовать YandexGPT."
+                "LLM_MODEL не указан, но используется прокси. Укажите модель (например, 'yandex/yandexgpt/rc' или 'gpt-3.5-turbo')."
             )
-        if not yc_api_key:  # and not yc_iam_token:
+            raise ValueError("LLM_MODEL должен быть указан при использовании прокси.")
+        if not proxy_api_key:  # Проверяем новую переменную proxy_api_key
+            logger.warning(
+                "api_key (ключ для прокси) не найден в .env, но используется прокси. "
+                "Для некоторых прокси (включая LiteLLM с некоторыми моделями) ключ может быть обязательным "
+                "или использоваться для маппинга. Устанавливаю 'EMPTY' по умолчанию."
+            )
+            proxy_api_key = "EMPTY"  # LiteLLM может работать с фиктивным ключом
+
+        try:
+            llm = ChatOpenAI(
+                model=llm_model_name,  # Например, "yandex/yandexgpt/rc" или "gpt-3.5-turbo"
+                temperature=0.1,  # Пример
+                openai_api_base=proxy_base_url,  # Используем proxy_base_url
+                openai_api_key=proxy_api_key,  # Используем proxy_api_key
+            )
+            logger.info(
+                f"ChatOpenAI успешно инициализирован для работы с моделью '{llm_model_name}' через прокси {proxy_base_url}."
+            )
+        except Exception as e:
             logger.error(
-                "YC_API_KEY (или YC_IAM_TOKEN) не установлен. Невозможно использовать YandexGPT."
+                f"Ошибка при инициализации ChatOpenAI через прокси: {e}",
+                exc_info=True,
+            )
+            raise ValueError(f"Не удалось настроить ChatOpenAI через прокси: {e}")
+
+    else:
+        # Этот блок теперь практически не должен использоваться, если всегда есть LiteLLM.
+        # Оставлен для обратной совместимости или если LiteLLM не используется.
+        logger.warning(
+            "base_url (прокси) не указан. Попытка настроить LLM напрямую (OpenAI или YandexGPT)."
+        )
+        if llm_model_name and llm_model_name.startswith("yandex/") and YANDEX_VERFÜGBAR:
+            logger.error(
+                "Прямая инициализация YandexGPT в этом потоке больше не поддерживается. "
+                "Пожалуйста, используйте LiteLLM прокси и укажите base_url."
+            )
+            # yc_folder_id = os.getenv("YC_FOLDER_ID")
+            # yc_api_key = os.getenv("YC_API_KEY")
+            # model_path_segment = llm_model_name.split("/", 1)[1]
+            # model_uri = f"gpt://{yc_folder_id}/{model_path_segment.replace('/', '-')}/latest"
+            # if not yc_folder_id or not yc_api_key:
+            #     logger.error("YC_FOLDER_ID или YC_API_KEY не установлены для прямой работы с YandexGPT.")
+            #     raise ValueError("Недостаточно данных для прямой инициализации YandexGPT.")
+            # try:
+            #     llm = YandexGPT(api_key=yc_api_key, folder_id=yc_folder_id, model_uri=model_uri, temperature=0.1, max_tokens=1500)
+            #     logger.info("YandexGPT (прямое подключение) успешно инициализирован.")
+            # except Exception as e:
+            #     logger.error(f"Ошибка при прямой инициализации YandexGPT: {e}", exc_info=True)
+            #     raise ValueError(f"Не удалось настроить YandexGPT напрямую: {e}")
+            raise NotImplementedError(
+                "Прямая инициализация YandexGPT удалена. Используйте LiteLLM прокси."
             )
 
-        if yc_folder_id and yc_api_key:  # или yc_iam_token
-            try:
-                logger.info(f"Попытка инициализации YandexGPT с model_uri: {model_uri}")
-                # Примечание: YandexGPT из langchain_community.llms может ожидать немного другой интерфейс
-                # для чат-подобных вызовов, чем ChatOpenAI. Langchain абстрагирует это,
-                # но нужно быть внимательным к передаче `messages`.
-                # Если есть ChatYandexGPT, он предпочтительнее. Пока используем YandexGPT.
-                llm = YandexGPT(
-                    api_key=yc_api_key,
-                    # iam_token=yc_iam_token, # если используется IAM токен
-                    folder_id=yc_folder_id,
-                    model_uri=model_uri,
-                    temperature=0.1,  # Пример температуры
-                    max_tokens=1500,  # Пример лимита токенов
+        elif (
+            llm_model_name
+        ):  # Подразумевается OpenAI или другая OpenAI-совместимая модель напрямую
+            openai_model_to_use = (
+                llm_model_name  # Используем LLM_MODEL как имя модели OpenAI
+            )
+            logger.info(
+                f"Используется модель OpenAI (прямое подключение): {openai_model_to_use}"
+            )
+            if not proxy_api_key:  # Проверяем proxy_api_key и здесь на всякий случай
+                logger.error(
+                    "api_key не найден. Прямое подключение к OpenAI невозможно (если это предполагалось)."
                 )
-                logger.info("YandexGPT успешно инициализирован.")
+                raise ValueError("api_key не указан для прямого подключения к OpenAI.")
+            try:
+                llm = ChatOpenAI(
+                    model=openai_model_to_use,
+                    temperature=0,
+                    openai_api_key=proxy_api_key,  # Используем proxy_api_key
+                )
+                logger.info("ChatOpenAI (прямое подключение) успешно инициализирован.")
             except Exception as e:
-                logger.error(f"Ошибка при инициализации YandexGPT: {e}", exc_info=True)
-                llm = None  # Возврат к OpenAI, если YandexGPT не удалось настроить
+                logger.error(
+                    f"Ошибка при прямой инициализации ChatOpenAI: {e}", exc_info=True
+                )
+                raise ValueError(f"Не удалось настроить ChatOpenAI напрямую: {e}")
         else:
-            logger.warning(
-                "Недостаточно данных для инициализации YandexGPT (нужен YC_FOLDER_ID и YC_API_KEY/YC_IAM_TOKEN)."
-            )
-            llm = None
-
-    if llm is None:  # Если YandexGPT не был настроен или выбран OpenAI
-        openai_model_to_use = os.getenv("OPENAI_MODEL_NAME", "gpt-3.5-turbo")
-        logger.info(f"Используется модель OpenAI: {openai_model_to_use}")
-        openai_api_base_proxy = os.getenv("OPENAI_API_BASE_PROXY")
-        openai_api_key_env = os.getenv("OPENAI_API_KEY")
-
-        if not openai_api_key_env:
             logger.error(
-                "OPENAI_API_KEY не найден в переменных окружения. OpenAI не будет работать."
+                "Не удалось определить, какую LLM инициализировать. Проверьте LLM_MODEL и base_url."
             )
-            # В этом случае агент не сможет работать, если YandexGPT тоже не настроен.
-            # Можно либо бросить исключение, либо он просто не будет отвечать.
-            # Для учебных целей оставим так, но в проде нужно обработать.
-            raise ValueError(
-                "Не удалось настроить ни одну LLM. Проверьте переменные окружения."
-            )
+            raise ValueError("Недостаточно конфигурации для инициализации LLM.")
 
-        if openai_api_base_proxy:
-            logger.info(f"Используется OpenAI через прокси: {openai_api_base_proxy}")
-            llm = ChatOpenAI(
-                model=openai_model_to_use,
-                temperature=0,
-                openai_api_base=openai_api_base_proxy,
-                openai_api_key=openai_api_key_env,
-            )
-        else:
-            logger.warning(
-                "OPENAI_API_BASE_PROXY не найден. Используется стандартный URL OpenAI."
-            )
-            llm = ChatOpenAI(
-                model=openai_model_to_use,
-                temperature=0,
-                openai_api_key=openai_api_key_env,
-            )
-        logger.info("ChatOpenAI успешно инициализирован.")
+    if llm is None:
+        # Эта проверка должна быть избыточной, если предыдущая логика корректно бросает ошибки
+        logger.critical("КРИТИЧЕСКАЯ ОШИБКА: LLM не был инициализирован!")
+        raise ValueError(
+            "Не удалось настроить ни одну LLM. Проверьте переменные окружения и логи."
+        )
 
     tool_registry.clear()
     tools_to_register = [
@@ -664,8 +1011,9 @@ def setup_agent():
         )
     elif not tool_registry and not TEST_TAVILY_ONLY_MODE:
         logger.warning(
-            "Внимание: Ни один инструмент не был успешно инициализирован! Агент будет работать без инструментов (кроме режима теста Tavily)."
-        )
+            "Внимание: Ни один инструмент не был успешно инициализирован! "
+            "Агент будет работать без инструментов (кроме режима теста Tavily)."
+        )  # В этом случае LLM все еще может быть инициализирована
     elif not TEST_TAVILY_ONLY_MODE:
         logger.info(f"Зарегистрированные инструменты: {list(tool_registry.keys())}")
 

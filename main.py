@@ -77,38 +77,94 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     initial_state = {"messages": [HumanMessage(content=message_text)]}
 
     try:
-        # Используем stream для получения событий от графа
-        # Вместо invoke, чтобы иметь возможность обрабатывать промежуточные шаги или просто получить конечный результат
+        # Используем astream_events для получения событий от графа
         final_response_content = ""
-        async for event in global_agent_executor.astream(initial_state, config=config):
-            # logger.debug(f"Событие от агента: {event}") # Очень многословно
-            # Нас интересует конечное событие, которое обычно является словарем с ключом "messages"
-            # или конкретный узел, возвращающий финальный AIMessage.
-            # Ищем ключ 'messages' в данных события последнего узла (END)
-            # Структура событий зависит от версии LangGraph и того, как настроен граф.
-            # Обычно последнее событие от узла перед END содержит финальное состояние.
+        # Добавляем version="v1" для нового формата событий
+        async for event in global_agent_executor.astream_events(
+            initial_state, config=config, version="v1"
+        ):
+            kind = event["event"]
+            logger.info(
+                f"Событие от агента: kind='{kind}', name='{event.get('name')}', tags='{event.get('tags')}'"
+            )
+            # Для очень детального лога можно раскомментировать следующую строку:
+            # logger.debug(f"Полное событие от агента (v1): {event}")
 
-            # Пример: если последний узел, который мы ожидаем перед END, это 'output_guardrails'
-            # и он возвращает состояние с обновленными messages.
-            # Или если мы смотрим на событие от самого узла END, у него есть data['output']
             if (
-                event.get("event") == "on_chain_end"
-                and event.get("name") == "LangGraph"
-            ):  # Общее завершение графа
-                final_state = event.get("data", {}).get("output")
-                if (
-                    final_state
-                    and isinstance(final_state, dict)
-                    and "messages" in final_state
-                ):
-                    if final_state["messages"] and isinstance(
-                        final_state["messages"][-1], AIMessage
-                    ):
-                        final_response_content = final_state["messages"][-1].content
-                        logger.info(
-                            f"Финальный ответ агента для пользователя {user_id}: {final_response_content}"
+                kind == "on_chat_model_stream" and event["name"] == "generate_response"
+            ):  # Или имя вашего узла LLM
+                # Это событие для стриминга токенов ответа, если вы хотите показывать ответ по мере генерации
+                # chunk = event["data"].get("chunk")
+                # if chunk and hasattr(chunk, 'content'):
+                #    logger.info(f"LLM Chunk: {chunk.content}")
+                #    # Здесь можно накапливать final_response_content += chunk.content и отправлять пользователю частями
+                pass  # Пока не реализуем пословный стриминг в Telegram
+
+            if kind == "on_chain_end" and event["name"] == "LangGraph":
+                logger.info(
+                    f"Получено событие on_chain_end для LangGraph. Данные: {event.get('data')}"
+                )
+                raw_final_output = event.get("data", {}).get("output")
+
+                # Ожидаем, что raw_final_output - это список словарей,
+                # где каждый словарь представляет вывод узла графа.
+                # Нам нужен вывод последнего узла (обычно output_guardrails).
+                if isinstance(raw_final_output, list) and raw_final_output:
+                    # Берем последний элемент списка, который должен быть словарем вывода последнего узла
+                    final_node_output_dict = raw_final_output[-1]
+                    if isinstance(final_node_output_dict, dict):
+                        # Ключ в этом словаре - имя узла, значение - его результат.
+                        # Мы не знаем точное имя ключа (может быть 'output_guardrails' или другое),
+                        # поэтому возьмем первое значение из словаря, предполагая, что оно содержит messages.
+                        if final_node_output_dict:
+                            actual_final_output = next(
+                                iter(final_node_output_dict.values()), None
+                            )
+                        else:
+                            actual_final_output = None
+                            logger.warning("Словарь вывода последнего узла пуст.")
+                    else:
+                        actual_final_output = None
+                        logger.warning(
+                            f"Последний элемент в raw_final_output не является словарем: {type(final_node_output_dict)}"
                         )
-                        break  # Получили финальный ответ
+                elif isinstance(raw_final_output, dict):
+                    # Обработка случая, если output все же словарь (старая логика)
+                    logger.info(
+                        "raw_final_output является словарем, используем его напрямую."
+                    )
+                    actual_final_output = raw_final_output
+                else:
+                    actual_final_output = None
+                    logger.warning(
+                        f"raw_final_output не является списком или словарем: {type(raw_final_output)}"
+                    )
+
+                if (
+                    actual_final_output
+                    and isinstance(actual_final_output, dict)
+                    and "messages" in actual_final_output
+                ):
+                    if actual_final_output["messages"] and isinstance(
+                        actual_final_output["messages"][-1], AIMessage
+                    ):
+                        final_response_content = actual_final_output["messages"][
+                            -1
+                        ].content
+                        logger.info(
+                            f"УСПЕШНО извлечен финальный ответ агента: {final_response_content}"
+                        )
+                    else:
+                        logger.warning(
+                            f"В actual_final_output['messages'] последнее сообщение не AIMessage или список пуст: {actual_final_output.get('messages')}"
+                        )
+                else:
+                    logger.warning(
+                        f"actual_final_output не содержит ключ 'messages' или не является словарем, или None. actual_final_output: {actual_final_output}"
+                    )
+            # Можно добавить обработку других типов событий, если это необходимо
+            # elif kind == "on_tool_end":
+            #    logger.info(f"Tool '{event.get('name')}' finished. Output: {event.get('data', {}).get('output')}")
 
         if not final_response_content:
             # Если после стрима не нашли подходящего ответа (маловероятно, если граф доходит до END)
