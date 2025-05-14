@@ -12,7 +12,8 @@ from .tools import (
     DeleteFAQTool,
     ContextAnalyzerTool,
     ChatHistorySearchTool,
-    YandexSearchApiTool,  # Используем новый инструмент поиска Яндекса
+    # YandexSearchApiTool, # Удаляем старый инструмент
+    TavilyYandexCloudSearchTool,  # Добавляем новый инструмент
 )
 
 # --- Настройка логгера ---
@@ -28,10 +29,11 @@ tool_descriptions: Dict[str, str] = {
     "search_chat_history": "Искать похожие вопросы и ответы в истории чата. Использовать, когда нужно найти ранее заданные похожие вопросы.",
     "context_analyzer": "Анализировать контекст разговора и извлекать ключевые темы и вопросы.",
     # Обновляем описание для нового инструмента поиска по документации
-    "search_yandex_documentation": (
+    "tavily_yandexcloud_search": (
         "Используй этот инструмент ПЕРВЫМ для поиска ответов на вопросы, касающиеся **Yandex Cloud**, "
-        "его сервисов, API, CLI и т.д., используя поиск **по официальной документации** через Yandex Search API. "
-        "Возвращает сгенерированный YandexGPT ответ на основе найденной документации."
+        "его сервисов, API, CLI, устранения неполадок и т.д., "
+        "используя поиск **по официальной документации** (`yandex.cloud/ru/docs/`) через Tavily. "
+        "Возвращает наиболее релевантные фрагменты из документации."
     ),
 }
 
@@ -43,7 +45,8 @@ tool_classes: List[Type] = [
     DeleteFAQTool,
     ChatHistorySearchTool,
     ContextAnalyzerTool,
-    YandexSearchApiTool,  # Используем новый инструмент
+    # YandexSearchApiTool, # Удаляем старый
+    TavilyYandexCloudSearchTool,  # Добавляем новый
 ]
 
 # Словарь для хранения инструментов по имени

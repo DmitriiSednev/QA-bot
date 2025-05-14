@@ -208,4 +208,7 @@ logs/
 
 # Local development
 .DS_Store
-Thumbs.db 
+Thumbs.db
+
+# Checkpoints for LangGraph
+checkpoints/ 

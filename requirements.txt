@@ -26,12 +26,20 @@ pyyaml==6.0.2
 requests==2.31.0
 portalocker==2.8.2
 
-# OCR (Опционально)
+# --- OCR (Опциональные зависимости) ---
+# Если функция распознавания текста из изображений не нужна, эти зависимости можно удалить.
 easyocr==1.7.2
-torch==2.7.0 # Зависимость easyocr
-numpy==2.2.5 # Зависимость easyocr/torch
-pillow==11.2.1 # Зависимость easyocr
-opencv-python-headless==4.11.0.86 # Зависимость easyocr
+torch==2.7.0              # Большая зависимость, основная для PyTorch
+torchvision==0.18.0        # Рекомендуется указать версию, совместимую с torch
+torchaudio==2.3.0         # Рекомендуется указать версию, совместимую с torch
+opencv-python-headless==4.11.0.86
+Pillow==11.2.1             # Часто является зависимостью easyocr/torchvision
+numpy==2.2.5               # Часто является зависимостью torch/opencv
+scipy                       # Зависимость easyocr (версия будет подобрана или можно указать явно)
+scikit-image                # Зависимость easyocr (версия будет подобрана или можно указать явно)
+pyclipper                   # Зависимость easyocr
+shapely                     # Зависимость easyocr
+# --- Конец блока OCR ---
 
 # Тестирование
 pytest==8.0.2
@@ -46,6 +54,7 @@ anyio==4.9.0
 beautifulsoup4==4.12.3
 certifi==2025.1.31
 charset-normalizer==3.4.1
+langchain-tavily==0.0.4 # Добавляем Tavily
 
 # Добавляем prometheus-client из ветки old-main
 prometheus-client==2.3.1 # или актуальная версия, если знаешь

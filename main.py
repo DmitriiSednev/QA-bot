@@ -3,11 +3,11 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
+import signal  # <--- ДОБАВЛЯЕМ ИМПОРТ
+import functools  # <--- ДОБАВЛЯЕМ ИМПОРТ
 
 # import io # Больше не нужен здесь
-import easyocr  # Оставляем для инициализации
-
-# import signal # Убираем импорт signal
+# import easyocr # УДАЛЯЕМ ИМПОРТ EASYOCR ОТСЮДА, он будет в handlers
 
 # import portalocker # Удаляем, т.к. логика в core.lock
 from typing import Optional, Dict, Set  # Any, List, Union могут быть не нужны
@@ -23,22 +23,46 @@ from telegram.ext import (
     Defaults,
     ApplicationBuilder,
     CallbackQueryHandler,  # Добавим, если будут инлайн-кнопки
+    AIORateLimiter,  # Для ограничения частоты запросов
 )
 from telegram.constants import ParseMode
 
 # --- Import Agent Logic ---
-from agent.graph_builder import setup_agent
+from agent.graph_builder import (
+    build_graph,  # Оставляем build_graph, если он где-то нужен, но setup_agent важнее
+    AgentState,
+)
+from agent import setup_agent  # <--- ИЗМЕНЕНИЕ ЗДЕСЬ
+from agent.llm_setup import (
+    setup_llm,
+)  # Для инициализации LLM (хотя build_graph это делает)
+from database.connection import get_db_session  # Оставляем только нужный импорт
+from database.redis_cache import (
+    RedisCache,
+    close_redis_connection,
+)  # Закрытие Redis и импорт класса
+from core.lock import (
+    acquire_lock,
+    release_lock,
+    register_signal_handlers,
+)  # ВОЗВРАЩАЕМ ЭТИ ИМПОРТЫ
+from telegram_interface.handlers import (
+    start,
+    # help_command, # УДАЛЕНО
+    # 개발자_정보_command,  # УДАЛЯЕМ ЭТОТ ИМПОРТ
+    handle_message,  # Основной обработчик сообщений
+    handle_photo,  # Обработчик изображений (OCR)
+    handle_new_chat_members,  # Обработчик добавления в чат
+    admin_command,  # Обработчик админ-команд
+)
+from telegram_interface.jobs import setup_jobs  # Настройка периодических задач
 
 # --- База данных и модели (если нужны напрямую, например, для первоначальной проверки админов) ---
 from database import connection, models
 from database.crud_admin import get_admin_by_user_id, add_admin
-from database.redis_cache import RedisCache  # Импортируем класс кеша
 
 # --- Импорт обработчиков и задач ---
 from telegram_interface import handlers, jobs
-
-# --- Импорт утилит блокировки ---
-from core.lock import acquire_lock, release_lock
 
 # --- Конфигурация логирования ---
 LOG_DIR = "logs"
@@ -72,7 +96,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_USER_IDS_STR = os.getenv("ADMIN_USER_IDS")
-BOT_USERNAME = os.getenv("BOT_USERNAME")  # Имя пользователя бота (без @)
+BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME")  # Имя пользователя бота (без @)
 
 # --- Обработка ID администраторов ---
 ADMIN_IDS: Set[int] = set()
@@ -150,25 +174,8 @@ except Exception as e:
     logger.error(f"Ошибка при инициализации Redis кэша: {e}", exc_info=True)
     redis_cache_instance = None
 
-# --- Инициализация OCR ---
-OCR_READER = None
-try:
-    # Указываем директорию для моделей, если нужно
-    # model_storage_directory = os.path.join(os.getcwd(), '.model_cache')
-    # os.makedirs(model_storage_directory, exist_ok=True)
-    OCR_READER = easyocr.Reader(
-        ["ru", "en"],
-        gpu=False,  # Установить в True, если есть GPU и нужные библиотеки
-        # model_storage_directory=model_storage_directory,
-        # download_enabled=True # Разрешить скачивание моделей
-    )
-    logger.info("OCR Reader (easyocr) инициализирован для языков [ru, en].")
-except Exception as e:
-    logger.error(
-        f"Ошибка инициализации OCR Reader: {e}. Обработка изображений будет недоступна.",
-        exc_info=True,
-    )
-    OCR_READER = None  # Убедимся, что None если ошибка
+# --- Инициализация OCR (УДАЛЕНО ОТСЮДА) ---
+# OCR_READER = None
 
 # --- Инициализация Агента LangGraph ---
 agent_app = None
@@ -176,40 +183,28 @@ checkpoint_db_connection = None  # Для хранения соединения 
 
 
 # Обертка для асинхронной инициализации агента
-async def initialize_bot_resources():
-    """Асинхронно инициализирует все ресурсы бота, включая агент."""
-    global agent_app, checkpoint_db_connection, redis_cache_instance, OCR_READER
+async def initialize_bot_resources(application: Application):
+    """Асинхронно инициализирует все ресурсы бота, кроме запуска самого приложения Telegram."""
+    global agent_app, checkpoint_db_connection, redis_cache_instance
 
-    # Инициализация Redis
-    redis_cache_instance = None
-    try:
-        redis_cache_instance = RedisCache()
-        if await asyncio.to_thread(
-            redis_cache_instance.ping
-        ):  # Выполняем ping в потоке
-            logger.info(
-                f"Успешное подключение к Redis: {os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/{os.getenv('REDIS_DB')}"
-            )
-        else:
-            logger.error(
-                "Не удалось подключиться к Redis. Кеширование будет отключено."
-            )
-            redis_cache_instance = None
-    except Exception as e:
-        logger.error(f"Ошибка при инициализации Redis кэша: {e}", exc_info=True)
-        redis_cache_instance = None
-
-    # Инициализация OCR
-    OCR_READER = None
-    try:
-        OCR_READER = await asyncio.to_thread(easyocr.Reader, ["ru", "en"], gpu=False)
-        logger.info("OCR Reader (easyocr) инициализирован для языков [ru, en].")
-    except Exception as e:
-        logger.error(
-            f"Ошибка инициализации OCR Reader: {e}. Обработка изображений будет недоступна.",
-            exc_info=True,
-        )
-        OCR_READER = None
+    # Инициализация Redis (ПЕРЕМЕЩЕНО ВЫШЕ, ВНЕ initialize_bot_resources)
+    # redis_cache_instance = None  # Сбрасываем, если была предыдущая попытка
+    # try:
+    #     redis_cache_instance = RedisCache()
+    #     if await asyncio.to_thread(
+    #         redis_cache_instance.ping
+    #     ):  # Выполняем ping в потоке
+    #         logger.info(
+    #             f"Успешное подключение к Redis: {os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/{os.getenv('REDIS_DB')}"
+    #         )
+    #     else:
+    #         logger.error(
+    #             "Не удалось подключиться к Redis. Кеширование будет отключено."
+    #         )
+    #         redis_cache_instance = None
+    # except Exception as e:
+    #     logger.error(f"Ошибка при инициализации Redis кэша: {e}", exc_info=True)
+    #     redis_cache_instance = None
 
     # Инициализация Агента LangGraph
     try:
@@ -225,138 +220,146 @@ async def initialize_bot_resources():
             logger.critical(
                 "Не удалось настроить приложение агента или соединение с БД чекпоинтера. Завершение работы."
             )
-            if agent_app_tuple and agent_app_tuple[1]:
-                await agent_app_tuple[1].close()
-            sys.exit(1)
+            if (
+                agent_app_tuple and agent_app_tuple[1]
+            ):  # Если соединение было создано, но агент нет
+                try:
+                    await agent_app_tuple[1].close()
+                except Exception as close_e:
+                    logger.error(
+                        f"Ошибка при закрытии checkpoint_db_connection после сбоя инициализации агента: {close_e}"
+                    )
+            sys.exit(1)  # Критическая ошибка, выходим
     except Exception as e:
         logger.critical(
             f"Критическая ошибка при асинхронной инициализации агента: {e}",
             exc_info=True,
         )
-        if checkpoint_db_connection:
+        if checkpoint_db_connection:  # Если соединение было создано до ошибки
             try:
                 await checkpoint_db_connection.close()
             except Exception as close_e:
                 logger.error(
-                    f"Ошибка при закрытии checkpoint_db_connection после сбоя инициализации: {close_e}"
+                    f"Ошибка при закрытии checkpoint_db_connection после сбоя инициализации агента: {close_e}"
                 )
-        sys.exit(1)
+        sys.exit(1)  # Критическая ошибка, выходим
+
+    # Сохранение важных данных в bot_data
+    application.bot_data["agent_app"] = agent_app
+    application.bot_data["ocr_reader"] = (
+        None  # Инициализация OCR будет ленивой в обработчике
+    )
+    application.bot_data["admin_ids"] = ADMIN_IDS
+    application.bot_data["bot_username"] = BOT_USERNAME
+    application.bot_data["redis_cache"] = redis_cache_instance
+    application.bot_data["days_to_keep_faq"] = int(os.getenv("DAYS_TO_KEEP_FAQ", "365"))
+    application.bot_data["days_to_keep_chat_history"] = int(
+        os.getenv("DAYS_TO_KEEP_CHAT_HISTORY", "30")
+    )
+    logger.info("Основные ресурсы бота (агент, Redis, bot_data) инициализированы.")
+
+
+# --- Новая функция для post_shutdown --- #
+async def custom_post_shutdown(app: Application):
+    """Асинхронные операции при завершении работы бота."""
+    logger.info("Начало выполнения custom_post_shutdown...")
+    global checkpoint_db_connection
+    if checkpoint_db_connection:
+        try:
+            await checkpoint_db_connection.close()
+            logger.info(
+                "Соединение aiosqlite для checkpointer успешно закрыто в post_shutdown."
+            )
+        except Exception as e:
+            logger.error(
+                f"Ошибка при закрытии соединения aiosqlite для checkpointer в post_shutdown: {e}",
+                exc_info=True,
+            )
+    else:
+        logger.info(
+            "Соединение aiosqlite (checkpointer) не было открыто или уже закрыто (post_shutdown)."
+        )
+
+    # Другие асинхронные операции по очистке, если они есть
+    # Например, если redis_cache_instance имел бы async close метод:
+    # global redis_cache_instance
+    # if redis_cache_instance and hasattr(redis_cache_instance, 'aclose'):
+    #     try:
+    #         await redis_cache_instance.aclose()
+    #         logger.info("Асинхронное соединение Redis успешно закрыто в post_shutdown.")
+    #     except Exception as e:
+    #         logger.error(f"Ошибка при асинхронном закрытии Redis в post_shutdown: {e}", exc_info=True)
+    logger.info("custom_post_shutdown завершен.")
 
 
 # --- Основная функция запуска бота ---
-async def main() -> None:
-    """Инициализирует ресурсы, настраивает и запускает бота."""
-    # 0. Захват блокировки файла (до инициализации ресурсов)
+def main() -> None:
+    global application_instance
+
     if not acquire_lock():
         sys.exit(1)
 
-    application = None  # Определяем application здесь для finally
+    application_instance = None
+
     try:
-        # 1. Асинхронная инициализация всех ресурсов
-        logger.info("Инициализация ресурсов бота...")
-        await initialize_bot_resources()
-        logger.info("Ресурсы бота успешно инициализированы.")
-
-        # 2. Гарантируем наличие первого админа в БД (синхронная операция)
-        ensure_initial_admin()
-
-        # 3. Настройка приложения Telegram
         logger.info("Настройка приложения Telegram...")
         defaults = Defaults(parse_mode=ParseMode.MARKDOWN)
-        application = (
+        application_instance = (
             ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).defaults(defaults).build()
         )
+        logger.info("Приложение Telegram настроено.")
 
-        # 4. Сохранение важных данных в bot_data
-        application.bot_data["agent_app"] = agent_app
-        application.bot_data["ocr_reader"] = OCR_READER
-        application.bot_data["admin_ids"] = ADMIN_IDS
-        application.bot_data["bot_username"] = BOT_USERNAME
-        application.bot_data["redis_cache"] = redis_cache_instance
-        application.bot_data["days_to_keep_faq"] = int(
-            os.getenv("DAYS_TO_KEEP_FAQ", "365")
-        )
-        application.bot_data["days_to_keep_history"] = int(
-            os.getenv("DAYS_TO_KEEP_CHAT_HISTORY", "30")
+        # Асинхронная инициализация через post_init
+        async def post_init(app: Application):
+            await initialize_bot_resources(app)
+            ensure_initial_admin()
+            logger.info("Асинхронная post_init инициализация завершена.")
+
+        application_instance.post_init = post_init
+        application_instance.post_shutdown = (
+            custom_post_shutdown  # <--- ПРИСВАИВАЕМ ФУНКЦИЮ
         )
 
-        # 5. Регистрация обработчиков
-        handlers.setup_handlers(
-            application
-        )  # Передаем application в функцию настройки хендлеров
+        handlers.setup_handlers(application_instance)
         logger.info("Обработчики команд и сообщений зарегистрированы.")
 
-        # 6. Настройка и запуск планировщика задач
-        jobs.setup_jobs(application)  # Передаем application в функцию настройки задач
+        jobs.setup_jobs(application_instance)
         logger.info("Планировщик задач настроен.")
 
-        # 7. Установка команд бота
-        async def set_commands(app: Application):
-            try:
-                await app.bot.set_my_commands(handlers.DEFAULT_COMMANDS)
-                logger.info("Команды бота успешно установлены.")
-            except Exception as e:
-                logger.error(f"Ошибка при установке команд бота: {e}", exc_info=True)
+        logger.info("Запуск бота (run_polling)...")
+        application_instance.run_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info("run_polling завершился (это неожиданно при штатной работе).")
 
-        application.post_init = set_commands
-
-        # 8. Запуск бота
-        logger.info("Запуск бота...")
-        await application.initialize()  # Инициализируем приложение
-        await application.start()  # Запускаем внутренние компоненты
-        await application.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES
-        )  # Начинаем опрос
-        logger.info("Бот успешно запущен и работает.")
-
-        # Поддерживаем работу скрипта (ожидание сигнала остановки)
-        # await application.updater.idle() # Этот метод блокирует и ждет сигналы
-        # Или просто бесконечный цикл
-        while True:
-            await asyncio.sleep(3600)  # Проверка каждые N секунд
-
-    except (KeyboardInterrupt, SystemExit) as e:
-        logger.warning(
-            f"Получен сигнал остановки ({type(e).__name__}). Завершение работы..."
-        )
-        # Логика остановки будет в finally
     except Exception as e:
-        logger.critical(f"Критическая ошибка во время работы бота: {e}", exc_info=True)
+        logger.critical(
+            f"MAIN: Unhandled Exception in main try block: {e}", exc_info=True
+        )
     finally:
-        logger.info("Начало процедуры остановки бота...")
-        if application and application.updater:
-            if application.updater.running:
-                logger.info("Остановка Polling...")
-                await application.updater.stop()
-            else:
-                logger.info("Polling уже был остановлен.")
-        else:
-            logger.warning(
-                "Application или Updater не инициализированы для остановки polling."
-            )
+        logger.info("Начало процедуры остановки бота (finally)...")
+        # Закрытие checkpoint_db_connection перенесено в custom_post_shutdown
+        # logger.info("Закрытие соединения с БД чекпоинтера...")
+        # global checkpoint_db_connection
+        # if checkpoint_db_connection:
+        #     try:
+        #         import asyncio
+        #         asyncio.run(checkpoint_db_connection.close())
+        #         logger.info("Соединение aiosqlite для checkpointer успешно закрыто.")
+        #     except Exception as e:
+        #         logger.error(
+        #             f"Ошибка при закрытии соединения aiosqlite для checkpointer: {e}",
+        #             exc_info=True,
+        #         )
+        # else:
+        #     logger.info("Соединение aiosqlite не было открыто или уже закрыто.")
 
-        if application:
-            logger.info("Остановка Application...")
-            await application.stop()
-            await application.shutdown()
-            logger.info("Application остановлен.")
-        else:
-            logger.warning(
-                "Application не был инициализирован для вызова stop/shutdown."
+        logger.info("Закрытие соединения с Redis (синхронно)...")
+        try:
+            close_redis_connection()  # Это синхронная функция
+            logger.info("Глобальное соединение Redis успешно закрыто (синхронно).")
+        except Exception as e:
+            logger.error(
+                f"Ошибка при вызове close_redis_connection: {e}", exc_info=True
             )
-
-        logger.info("Закрытие соединения с БД чекпоинтера...")
-        if checkpoint_db_connection:
-            try:
-                await checkpoint_db_connection.close()
-                logger.info("Соединение aiosqlite для checkpointer успешно закрыто.")
-            except Exception as e:
-                logger.error(
-                    f"Ошибка при закрытии соединения aiosqlite для checkpointer: {e}",
-                    exc_info=True,
-                )
-        else:
-            logger.info("Соединение aiosqlite не было открыто или уже закрыто.")
 
         logger.info("Освобождение блокировки файла...")
         release_lock()
@@ -364,4 +367,35 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Инициализация Redis (как и было)
+    if redis_cache_instance is None:
+        logger.info("Переинициализация Redis Cache перед запуском...")
+        try:
+            redis_cache_instance = RedisCache()
+            if redis_cache_instance.ping():
+                logger.info(
+                    f"Успешное подключение к Redis перед запуском: {os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/{os.getenv('REDIS_DB')}"
+                )
+            else:
+                logger.error(
+                    "Не удалось подключиться к Redis перед запуском. Кеширование будет отключено."
+                )
+                redis_cache_instance = None
+        except Exception as e:
+            logger.error(
+                f"Ошибка при переинициализации Redis кэша перед запуском: {e}",
+                exc_info=True,
+            )
+            redis_cache_instance = None
+
+    # Просто вызываем main(), НЕ asyncio.run(main())
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.warning("Получен сигнал KeyboardInterrupt. Завершение бота...")
+    except SystemExit as e:
+        logger.warning(f"Получен сигнал SystemExit ({e}). Завершение бота...")
+    except Exception as e:
+        logger.critical(
+            f"Необработанное исключение на верхнем уровне: {e}", exc_info=True
+        )
