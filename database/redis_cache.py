@@ -209,3 +209,23 @@ def clear_cache_by_prefix(prefix: str) -> int:
             exc_info=True,
         )
         return deleted_count
+
+
+def close_redis_connection():
+    """Закрывает глобальное соединение с Redis, если оно было установлено."""
+    global redis_client
+    if redis_client:
+        try:
+            redis_client.close()
+            logger.info("Глобальное соединение Redis успешно закрыто.")
+            redis_client = (
+                None  # Сбрасываем, чтобы get_redis_client() не вернул закрытый клиент
+            )
+        except Exception as e:
+            logger.error(
+                f"Ошибка при закрытии глобального соединения Redis: {e}", exc_info=True
+            )
+    else:
+        logger.info(
+            "Глобальное соединение Redis не было инициализировано или уже закрыто."
+        )

@@ -7,7 +7,7 @@ from .search_faq import SearchFAQTool
 from .update_faq import UpdateFAQTool
 from .context_analyzer import ContextAnalyzerTool
 from .chat_history_search import ChatHistorySearchTool
-from .yandex_search_api_tool import YandexSearchApiTool
+from .tavily_yandexcloud_search import TavilyYandexCloudSearchTool
 
 __all__ = [
     "BaseSearchTool",
@@ -18,5 +18,5 @@ __all__ = [
     "UpdateFAQTool",
     "ContextAnalyzerTool",
     "ChatHistorySearchTool",
-    "YandexSearchApiTool",
+    "TavilyYandexCloudSearchTool",
 ]
