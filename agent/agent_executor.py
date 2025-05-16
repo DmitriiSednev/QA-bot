@@ -722,58 +722,44 @@ async def response_generator_node(state: AgentState, llm: ChatOpenAI):
     # ChatOpenAI может сам позаботиться о правильном формате, если передать tool_registry
     # Однако, для простого вызова invoke/ainvoke может потребоваться явная передача `tools`.
 
-    # Проверим, есть ли в истории ToolMessage. Если да, то передадим tools.
-    has_tool_message = any(isinstance(msg, ToolMessage) for msg in messages_for_llm)
+    # Проверим, есть ли в истории ToolMessage.
+    # has_tool_message = any(isinstance(msg, ToolMessage) for msg in messages_for_llm) # Это было для предыдущей логики
 
     try:
-        if has_tool_message:
-            logger.info(
-                f"Передаем LLM список инструментов: {[tool.name for tool in tool_registry.values()]}"
-            )
-            # Для ChatOpenAI, чтобы он правильно обработал tools, их нужно передавать в .bind_tools()
-            # или правильно сформировать tools параметр для .ainvoke()
-            # Используем .bind_tools для корректной передачи.
-            # llm_with_tools = llm.bind_tools([tool_registry[tool_name] for tool_name in tools_for_llm]) # это если tool_registry содержит сами объекты
-            # На самом деле, router_node уже биндит инструменты к llm.
-            # Если мы просто вызываем llm.ainvoke, и llm уже с привязанными инструментами, этого должно быть достаточно.
-            # Но ошибка "No tools were provided" говорит об обратном для YandexGPT через LiteLLM.
-            # Попробуем передать параметр `tools` явно, если это поддерживается ChatOpenAI.
-            # Стандартный ChatOpenAI.ainvoke принимает messages, stop, config, **kwargs.
-            # Параметр `tools` обычно передается при инициализации или через .bind_tools().
-
-            # Самый надежный способ - это использовать llm.bind_tools, если llm - это ChatOpenAI инстанс
-            # из setup_agent, к которому УЖЕ были привязаны инструменты через .bind_tools в router_node.
-            # Проблема в том, что router_node вызывает llm.invoke, а здесь мы вызываем llm.ainvoke.
-            # llm, переданный в response_generator_node, это тот же самый llm, что и в router_node.
-            # Если инструменты были привязаны в router_node, они должны быть доступны и здесь.
-
-            # Ошибка "No tools were provided" от LiteLLM/YandexGPT намекает, что он ожидает tools в КАЖДОМ запросе,
-            # если в истории есть ToolMessage, а не только в том, который генерирует tool_calls.
-
-            # Соберем описания инструментов в формате, который может ожидать OpenAI/LiteLLM
-            formatted_tools = []
-            for tool_name, tool_instance in tool_registry.items():
-                formatted_tools.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": tool_instance.name,
-                            "description": tool_instance.description,
-                            "parameters": (
-                                tool_instance.args_schema.schema()
-                                if tool_instance.args_schema
-                                else {}
-                            ),
-                        },
-                    }
-                )
-            logger.info(f"Явно передаем tools в ainvoke: {formatted_tools}")
-            response_ai_message: AIMessage = await llm.ainvoke(
-                messages_for_llm, tools=formatted_tools  # ЯВНАЯ ПЕРЕДАЧА ИНСТРУМЕНТОВ
-            )
-        else:
-            # Если ToolMessage в истории нет, вызываем как обычно
-            response_ai_message: AIMessage = await llm.ainvoke(messages_for_llm)
+        # --- ИЗМЕНЕНИЕ: Убираем явную передачу tools ---
+        # Если узел response_generator_node вызывается, его задача - сгенерировать текстовый ответ.
+        # Передача списка инструментов здесь может путать LLM, заставляя ее пытаться снова вызвать инструмент.
+        # Предполагается, что если LLM должна была вызвать инструмент, это сделал бы router_node.
+        # if has_tool_message:
+        #     logger.info(
+        #         f"Передаем LLM список инструментов (УБРАНО ДЛЯ ТЕСТА): {[tool.name for tool in tool_registry.values()]}"
+        #     )
+        #     formatted_tools = []
+        #     for tool_name, tool_instance in tool_registry.items():
+        #         formatted_tools.append(
+        #             {
+        #                 "type": "function",
+        #                 "function": {
+        #                     "name": tool_instance.name,
+        #                     "description": tool_instance.description,
+        #                     "parameters": (
+        #                         tool_instance.args_schema.schema()
+        #                         if tool_instance.args_schema
+        #                         else {}
+        #                     ),
+        #                 },
+        #             }
+        #         )
+        #     logger.info(f"Явно передаем tools в ainvoke (УБРАНО ДЛЯ ТЕСТА): {formatted_tools}")
+        #     response_ai_message: AIMessage = await llm.ainvoke(
+        #         messages_for_llm, tools=formatted_tools  # ЯВНАЯ ПЕРЕДАЧА ИНСТРУМЕНТОВ - УБРАНО
+        #     )
+        # else:
+        #     # Если ToolMessage в истории нет, вызываем как обычно
+        logger.info(
+            "Вызов LLM в response_generator_node для генерации текстового ответа (без явной передачи tools)."
+        )
+        response_ai_message: AIMessage = await llm.ainvoke(messages_for_llm)
 
         logger.info(
             f"Получено от LLM: {response_ai_message.content if response_ai_message else 'No content'}"
