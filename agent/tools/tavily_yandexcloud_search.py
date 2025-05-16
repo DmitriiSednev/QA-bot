@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from typing import Type, List, Dict, Any, Optional
 
 from langchain_core.callbacks import CallbackManagerForToolRun
@@ -16,6 +17,8 @@ logger = logging.getLogger(__name__)
 # --- Константы ---
 # Домен для поиска по документации Yandex Cloud
 YANDEX_CLOUD_DOCS_DOMAIN = "yandex.cloud/ru/docs/"
+MAX_SNIPPET_LENGTH = 500
+DEFAULT_MAX_RESULTS = 5
 
 
 class TavilyYandexCloudSearchInput(BaseModel):
@@ -50,11 +53,11 @@ class TavilyYandexCloudSearchTool(BaseTool):
         try:
             # Ключ TAVILY_API_KEY должен быть в переменных окружения
             self.tavily_search_client = TavilySearchResults(
-                max_results=5,  # Количество результатов по умолчанию
-                # topic="general", # Можно убрать, если не нужно ограничивать тематику заранее
-                # search_depth="advanced", # Можно установить глубину поиска, если нужно
+                max_results=DEFAULT_MAX_RESULTS,
             )
-            logger.info("Tavily Search API клиент успешно инициализирован.")
+            logger.info(
+                f"Tavily Search API клиент успешно инициализирован с max_results={DEFAULT_MAX_RESULTS}"
+            )
         except Exception as e:
             logger.error(
                 f"Ошибка инициализации клиента Tavily Search API: {e}. Убедитесь, что TAVILY_API_KEY установлен.",
@@ -71,8 +74,12 @@ class TavilyYandexCloudSearchTool(BaseTool):
         Выполняет поиск через Tavily Search API, ограничиваясь доменом yandex.cloud/ru/docs.
         """
         if not self.tavily_search_client:
+            logger.error(
+                "Попытка выполнить поиск без инициализированного клиента Tavily"
+            )
             return "Ошибка: Клиент Tavily Search API не инициализирован. Проверьте TAVILY_API_KEY."
 
+        start_time = time.time()
         logger.info(
             f"Запуск TavilyYandexCloudSearchTool с запросом: '{query}' для домена '{YANDEX_CLOUD_DOCS_DOMAIN}'"
         )
@@ -102,9 +109,14 @@ class TavilyYandexCloudSearchTool(BaseTool):
                 tool_input_args
             )
 
+            search_time = time.time() - start_time
+            logger.info(
+                f"Поиск завершен за {search_time:.2f}с. Найдено результатов: {len(raw_results)}"
+            )
             logger.debug(f"Получены сырые результаты от Tavily: {raw_results}")
 
             if not raw_results:
+                logger.warning(f"Поиск не дал результатов для запроса: '{query}'")
                 return f"Поиск по документации Yandex Cloud ('{YANDEX_CLOUD_DOCS_DOMAIN}') через Tavily не дал результатов по запросу: '{query}'."
 
             # Форматируем результаты в строку
@@ -115,19 +127,24 @@ class TavilyYandexCloudSearchTool(BaseTool):
                 content_snippet = result.get("content", "Нет содержимого")
 
                 # Обрезаем слишком длинные сниппеты, если нужно
-                max_snippet_length = 500
-                if len(content_snippet) > max_snippet_length:
-                    content_snippet = content_snippet[:max_snippet_length] + "..."
+                if len(content_snippet) > MAX_SNIPPET_LENGTH:
+                    content_snippet = content_snippet[:MAX_SNIPPET_LENGTH] + "..."
+                    logger.debug(
+                        f"Сниппет для результата {i} обрезан до {MAX_SNIPPET_LENGTH} символов"
+                    )
 
                 formatted_response += f"{i}. {title}\n"
                 formatted_response += f"   Источник: {url}\n"
                 formatted_response += f"   Фрагмент: {content_snippet}\n\n"
 
+            total_time = time.time() - start_time
+            logger.info(f"Полная обработка запроса заняла {total_time:.2f}с")
             return formatted_response.strip()
 
         except Exception as e:
+            error_time = time.time() - start_time
             logger.error(
-                f"Ошибка при выполнении поиска Tavily для Yandex Cloud: {e}",
+                f"Ошибка при выполнении поиска Tavily для Yandex Cloud (заняло {error_time:.2f}с): {e}",
                 exc_info=True,
             )
             return f"Произошла ошибка при поиске в документации Yandex Cloud через Tavily: {e}"
@@ -142,8 +159,12 @@ class TavilyYandexCloudSearchTool(BaseTool):
         TavilySearchResults поддерживает асинхронный вызов через `ainvoke`.
         """
         if not self.tavily_search_client:
+            logger.error(
+                "Попытка выполнить асинхронный поиск без инициализированного клиента Tavily"
+            )
             return "Ошибка: Клиент Tavily Search API не инициализирован. Проверьте TAVILY_API_KEY."
 
+        start_time = time.time()
         logger.info(
             f"Асинхронный запуск TavilyYandexCloudSearchTool с запросом: '{query}' для домена '{YANDEX_CLOUD_DOCS_DOMAIN}'"
         )
@@ -153,6 +174,7 @@ class TavilyYandexCloudSearchTool(BaseTool):
                 "query": query,
                 "include_domains": [YANDEX_CLOUD_DOCS_DOMAIN],
             }
+            logger.debug(f"Параметры асинхронного поиска: {tool_input_args}")
 
             raw_results: List[Dict[str, Any]] = await self.tavily_search_client.ainvoke(
                 tool_input_args
@@ -162,6 +184,9 @@ class TavilyYandexCloudSearchTool(BaseTool):
             )
 
             if not raw_results:
+                logger.warning(
+                    f"Асинхронный поиск не дал результатов для запроса: '{query}'"
+                )
                 return f"Асинхронный поиск по документации Yandex Cloud ('{YANDEX_CLOUD_DOCS_DOMAIN}') через Tavily не дал результатов по запросу: '{query}'."
 
             formatted_response = f"Результаты асинхронного поиска по документации Yandex Cloud для запроса '{query}':\n\n"
@@ -169,18 +194,27 @@ class TavilyYandexCloudSearchTool(BaseTool):
                 title = result.get("title", "Без заголовка")
                 url = result.get("url", "URL не указан")
                 content_snippet = result.get("content", "Нет содержимого")
-                max_snippet_length = 500
-                if len(content_snippet) > max_snippet_length:
-                    content_snippet = content_snippet[:max_snippet_length] + "..."
+
+                if len(content_snippet) > MAX_SNIPPET_LENGTH:
+                    content_snippet = content_snippet[:MAX_SNIPPET_LENGTH] + "..."
+                    logger.debug(
+                        f"Сниппет для асинхронного результата {i} обрезан до {MAX_SNIPPET_LENGTH} символов"
+                    )
+
                 formatted_response += f"{i}. {title}\n"
                 formatted_response += f"   Источник: {url}\n"
                 formatted_response += f"   Фрагмент: {content_snippet}\n\n"
 
+            total_time = time.time() - start_time
+            logger.info(
+                f"Полная асинхронная обработка запроса заняла {total_time:.2f}с"
+            )
             return formatted_response.strip()
 
         except Exception as e:
+            error_time = time.time() - start_time
             logger.error(
-                f"Ошибка при асинхронном выполнении поиска Tavily для Yandex Cloud: {e}",
+                f"Ошибка при асинхронном выполнении поиска Tavily для Yandex Cloud (заняло {error_time:.2f}с): {e}",
                 exc_info=True,
             )
             return f"Произошла ошибка при асинхронном поиске в документации Yandex Cloud через Tavily: {e}"

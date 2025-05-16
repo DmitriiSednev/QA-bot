@@ -1,6 +1,8 @@
 import asyncio
 import logging
 from typing import Dict, Any, List, Union
+import time
+from datetime import datetime
 
 from telegram.ext import ContextTypes
 from telegram import (
@@ -24,11 +26,19 @@ async def run_agent_for_user(
     user_id: int, chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Вызывает LangGraph агент для обработки сообщения пользователя."""
+    start_time = time.perf_counter()
+    request_received_dt = datetime.now()
+    logger.info(
+        f"[{request_received_dt}] run_agent_for_user НАЧАЛО для user_id: {user_id}, chat_id: {chat_id}. Текст: '{text[:50]}...'"
+    )
+
     agent_app = context.application.bot_data.get("agent_app")
     if not agent_app:
-        logger.error("Агент (agent_app) не найден в bot_data!")
+        logger.error(
+            f"[{datetime.now()}] Агент не найден в bot_data. Завершение для user_id: {user_id}."
+        )
         await context.bot.send_message(
-            chat_id=chat_id, text="Ошибка конфигурации бота."
+            chat_id=chat_id, text="Ошибка: агент не инициализирован."
         )
         return
 
@@ -160,8 +170,15 @@ async def run_agent_for_user(
         )
 
     try:
+        send_start_time = time.perf_counter()
+        logger.info(
+            f"[{datetime.now()}] ПЕРЕД отправкой сообщения в Telegram. User_id: {user_id}, chat_id: {chat_id}."
+        )
         await context.bot.send_message(
             chat_id=chat_id, text=final_response, parse_mode=ParseMode.MARKDOWN
+        )
+        logger.info(
+            f"[{datetime.now()}] ПОСЛЕ отправки сообщения в Telegram. Время отправки: {time.perf_counter() - send_start_time:.4f} сек."
         )
     except Exception as send_error:  # Более конкретное имя для ошибки отправки
         logger.error(
@@ -176,6 +193,10 @@ async def run_agent_for_user(
                 f"Не удалось отправить ответ даже без форматирования: {e2}",
                 exc_info=True,
             )
+    finally:
+        logger.info(
+            f"[{datetime.now()}] run_agent_for_user КОНЕЦ для user_id: {user_id}. Общее время: {time.perf_counter() - start_time:.4f} сек."
+        )
 
 
 def _add_to_faq_if_new(text: str, final_response: str):

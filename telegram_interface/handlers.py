@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from typing import Dict, Any, List, Union
+from datetime import datetime
 
 from telegram import Update, BotCommand, Message
 from telegram.ext import (
@@ -13,7 +14,11 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from database import connection, models
-from database.crud_admin import get_all_active_admins, add_admin, deactivate_admin
+from database.crud_admin import (
+    get_all_active_admins_async,
+    add_admin_async,
+    deactivate_admin_async,
+)
 from database.embeddings import clear_embedding_cache
 from .image_processor import process_image_and_run_agent
 from .agent_utils import run_agent_for_user
@@ -46,15 +51,17 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     action = args[0].lower()
-    try:
+
+    async def db_operations():
         with connection.get_db_session() as db:
             if not db:
                 await message.reply_text(
                     "Ошибка: Не удалось получить сессию базы данных."
                 )
                 return
+
             if action == "list":
-                admins = get_all_active_admins(db)
+                admins = await get_all_active_admins_async(db)
                 if not admins:
                     await message.reply_text("Список админов пуст.")
                 else:
@@ -84,7 +91,9 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     target_username = args[2] if len(args) > 2 else None
                     if target_username and target_username.startswith("@"):
                         target_username = target_username[1:]
-                    added_admin = add_admin(db, target_user_id, target_username)
+                    added_admin = await add_admin_async(
+                        db, target_user_id, target_username
+                    )
                     if added_admin:
                         await message.reply_text(
                             f"Админ ID:`{target_user_id}` (Username: @{added_admin.username or 'N/A'}) успешно добавлен.",
@@ -96,7 +105,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             parse_mode=ParseMode.MARKDOWN,
                         )
                 elif action == "remove":
-                    if deactivate_admin(db, target_user_id):
+                    if await deactivate_admin_async(db, target_user_id):
                         await message.reply_text(
                             f"Админ ID:`{target_user_id}` деактивирован.",
                             parse_mode=ParseMode.MARKDOWN,
@@ -110,6 +119,9 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await message.reply_text(
                     "Неизвестное действие. Используйте: list, add, remove"
                 )
+
+    try:
+        await asyncio.to_thread(db_operations)
     except Exception as e:
         logger.error(f"Ошибка в команде admin: {e}", exc_info=True)
         await message.reply_text("Произошла ошибка при выполнении команды.")
@@ -204,6 +216,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(
         f"Вызов агента для user {user_id} в чате {chat_id} (упомянут/ЛС: {mentioned_or_reply_or_private}), текст: '{text[:50]}...'"
     )
+    request_time = datetime.now()
+    logger.info(
+        f"[{request_time}] Готовимся вызвать run_agent_for_user для user_id: {user_id}, chat_id: {chat_id}"
+    )
     asyncio.create_task(run_agent_for_user(user_id, chat_id, text, context))
 
 
@@ -249,7 +265,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Получил фото, начинаю распознавание текста...",
         reply_to_message_id=update.message.message_id,
     )
-
+    request_time_photo = datetime.now()
+    logger.info(
+        f"[{request_time_photo}] Готовимся вызвать process_image_and_run_agent для user_id: {user_id}, chat_id: {chat_id}"
+    )
     asyncio.create_task(
         process_image_and_run_agent(
             photo_file_id, user_id, chat_id, text_from_caption, context, processing_msg

@@ -107,3 +107,4 @@ async def process_image_and_run_agent(
             await context.bot.send_message(
                 chat_id=chat_id, text="Произошла ошибка при обработке изображения."
             )
+ 
