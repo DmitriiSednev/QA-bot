@@ -1,6 +1,46 @@
 # QA Telegram Bot с LangGraph и Supabase
 
+![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)
+![LangGraph](https://img.shields.io/badge/LangGraph-agent-1C3C3C?logo=langchain&logoColor=white)
+![Supabase](https://img.shields.io/badge/Supabase-pgvector-3FCF8E?logo=supabase&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
+
 Это Telegram-бот, предназначенный для ответов на вопросы пользователей, использующий базу знаний (FAQ) и историю чатов. Бот построен с использованием Langchain, LangGraph, SQLAlchemy для взаимодействия с базой данных Supabase (PostgreSQL + pgvector) и Alembic для управления миграциями схемы БД.
+
+## Архитектура агента
+
+Ядро бота — граф LangGraph с guardrails на входе и выходе, LLM-роутером и набором инструментов:
+
+```mermaid
+flowchart TD
+    TG[Telegram message] --> IG[input_guardrails]
+    IG --> R{router LLM}
+    R -->|tool_calls| TE[tool_executor]
+    R -->|direct answer| OG[output_guardrails]
+    TE --> TOG[tool_output_guardrails]
+    TOG --> RG[response_generator]
+    RG --> OG
+    OG --> OUT[Reply to user]
+
+    subgraph Tools
+        T1[search_faq — векторный поиск pgvector]
+        T2[chat_history_search]
+        T3[add / update / delete FAQ]
+        T4[web search — Tavily / Yandex Cloud]
+        T5[context_analyzer]
+    end
+    TE -.-> Tools
+
+    subgraph Storage
+        S1[(Supabase: PostgreSQL + pgvector)]
+        S2[(SQLite checkpointer — состояние диалогов)]
+    end
+    T1 -.-> S1
+    T2 -.-> S1
+    R -.-> S2
+```
+
+Состояние диалога персистится через `AsyncSqliteSaver` (LangGraph checkpointing), поэтому бот переживает рестарты без потери контекста беседы.
 
 ## Стек Технологий
 
