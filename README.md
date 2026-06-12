@@ -1,5 +1,6 @@
 # QA Telegram Bot с LangGraph и Supabase
 
+[![CI](https://github.com/DmitriiSednev/QA-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/DmitriiSednev/QA-bot/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)
 ![LangGraph](https://img.shields.io/badge/LangGraph-agent-1C3C3C?logo=langchain&logoColor=white)
 ![Supabase](https://img.shields.io/badge/Supabase-pgvector-3FCF8E?logo=supabase&logoColor=white)

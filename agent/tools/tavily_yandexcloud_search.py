@@ -222,6 +222,8 @@ class TavilyYandexCloudSearchTool(BaseTool):
 
 # Пример использования (для локального теста, если нужно)
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+
     load_dotenv()  # Убедитесь, что TAVILY_API_KEY есть в .env
 
     logging.basicConfig(level=logging.INFO)
